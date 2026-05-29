@@ -1,0 +1,26 @@
+# Build output
+build/
+
+# Compiled objects and binaries
+*.o
+*.elf
+*.bin
+*.iso
+
+# Disk images
+*.img
+
+# Downloaded packages
+*.deb
+
+# Debug / core files
+*.log
+core
+*.core
+
+# Editor / OS junk
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
