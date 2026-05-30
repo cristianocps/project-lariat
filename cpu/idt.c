@@ -2,6 +2,17 @@
 #include "ports.h"
 #include "serial.h"
 #include "vga.h"
+#include "lapic.h"
+#include "smp.h"
+#include "sched.h"
+
+/* When non-zero, the 8259 PICs are disabled and all maskable interrupts are
+ * delivered (and acknowledged) through the local APIC. */
+static int apic_mode = 0;
+
+void idt_set_apic_mode(int on) {
+    apic_mode = on;
+}
 
 struct idt_entry {
     uint16_t offset_low;
@@ -56,10 +67,22 @@ static void panic_dump(registers_t *r) {
                   exception_names[r->int_no], r->int_no, r->error_code);
     serial_printf(SERIAL_COM1, "  RAX=0x%llx RCX=0x%llx RDX=0x%llx RBX=0x%llx\n",
                   r->rax, r->rcx, r->rdx, r->rbx);
-    serial_printf(SERIAL_COM1, "  RBP=0x%llx RSI=0x%llx RDI=0x%llx RSP=0x%llx\n",
-                  r->rbp, r->rsi, r->rdi, (uint64_t)r + sizeof(registers_t));
+    /* For a ring-3 fault the CPU pushed user RSP/SS right after RFLAGS. */
+    uint64_t *after = (uint64_t *)(r + 1);
+    serial_printf(SERIAL_COM1, "  RBP=0x%llx RSI=0x%llx RDI=0x%llx uRSP=0x%llx\n",
+                  r->rbp, r->rsi, r->rdi, after[0]);
     serial_printf(SERIAL_COM1, "  RIP=0x%llx CS=0x%x RFLAGS=0x%llx\n",
                   r->rip, r->cs, r->rflags);
+    {
+        struct thread *ct = current_thread();
+        if (ct)
+            serial_printf(SERIAL_COM1, "  cur tid=%d name=%s\n",
+                          (int)ct->tid, ct->name);
+    }
+    uint64_t cr2, cr3;
+    __asm__ __volatile__("mov %%cr2, %0" : "=r"(cr2));
+    __asm__ __volatile__("mov %%cr3, %0" : "=r"(cr3));
+    serial_printf(SERIAL_COM1, "  CR2=0x%llx CR3=0x%llx\n", cr2, cr3);
 
     vga_set_color(VGA_COLOR(VGA_LIGHT_RED, VGA_BLACK));
     vga_print("\nKERNEL PANIC: ");
@@ -74,10 +97,26 @@ void isr_handler(registers_t *r) {
         panic_dump(r);
     }
 
-    if (r->int_no >= 40) {
-        outb(0xA0, 0x20);
+    if (apic_mode) {
+        /* APIC mode: every device/IPI interrupt is acknowledged at the local
+         * APIC.  The timer handler issues its own EOI before it may switch
+         * contexts; for all other vectors we EOI here after dispatch. */
+        if (interrupt_handlers[r->int_no]) {
+            interrupt_handlers[r->int_no](r);
+        }
+        if (r->int_no >= 32 && r->int_no != VEC_LAPIC_TIMER) {
+            lapic_eoi();
+        }
+        return;
     }
-    outb(0x20, 0x20);
+
+    /* Legacy PIC mode: IRQ vectors (32-47) get a PIC EOI. */
+    if (r->int_no >= 32 && r->int_no < 48) {
+        if (r->int_no >= 40) {
+            outb(0xA0, 0x20);
+        }
+        outb(0x20, 0x20);
+    }
 
     if (interrupt_handlers[r->int_no]) {
         interrupt_handlers[r->int_no](r);
@@ -93,11 +132,11 @@ void idt_init(void) {
         interrupt_handlers[i] = 0;
     }
 
-    #define CS_KERNEL 0x18
+    #define CS_KERNEL 0x08
     idt_set_gate(0,  (uint64_t)isr_0,  CS_KERNEL, 0x8E);
     idt_set_gate(1,  (uint64_t)isr_1,  CS_KERNEL, 0x8E);
     idt_set_gate(2,  (uint64_t)isr_2,  CS_KERNEL, 0x8E);
-    idt_set_gate(3,  (uint64_t)isr_3,  CS_KERNEL, 0x8E);
+    idt_set_gate(3,  (uint64_t)isr_3,  CS_KERNEL, 0xEF);  /* Trap gate, DPL=3 for int3 from userspace */
     idt_set_gate(4,  (uint64_t)isr_4,  CS_KERNEL, 0x8E);
     idt_set_gate(5,  (uint64_t)isr_5,  CS_KERNEL, 0x8E);
     idt_set_gate(6,  (uint64_t)isr_6,  CS_KERNEL, 0x8E);
@@ -144,5 +183,18 @@ void idt_init(void) {
     idt_set_gate(46, (uint64_t)irq_14, CS_KERNEL, 0x8E);
     idt_set_gate(47, (uint64_t)irq_15, CS_KERNEL, 0x8E);
 
+    /* APIC / IPI vectors */
+    extern void isr_240(void);
+    extern void isr_253(void);
+    extern void isr_255(void);
+    idt_set_gate(240, (uint64_t)isr_240, CS_KERNEL, 0x8E);
+    idt_set_gate(253, (uint64_t)isr_253, CS_KERNEL, 0x8E);
+    idt_set_gate(255, (uint64_t)isr_255, CS_KERNEL, 0x8E);
+
+    __asm__ __volatile__("lidt %0" :: "m"(idt_p));
+}
+
+/* Load the (shared) IDT on an application processor. */
+void idt_load_ap(void) {
     __asm__ __volatile__("lidt %0" :: "m"(idt_p));
 }

@@ -1,10 +1,12 @@
 #include "pmm.h"
 #include "serial.h"
 #include "vga.h"
+#include "kapi.h"
 
 /* --------------------------------------------------------------------------
  * PMM state
  * -------------------------------------------------------------------------- */
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 static uint8_t *bitmap = NULL;
 static uint64_t bitmap_size = 0;     /* in bytes */
 static uint64_t total_pages = 0;
@@ -56,13 +58,16 @@ void pmm_mark_free(uint64_t phys, size_t count) {
  * Allocate / Free
  * -------------------------------------------------------------------------- */
 uint64_t pmm_alloc_page(void) {
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
     for (uint64_t i = 0; i < total_pages; i++) {
         if (!bitmap_test(i)) {
             bitmap_set(i);
             free_page_count--;
+            spin_unlock_irqrestore(&pmm_lock, flags);
             return pmm_page_to_phys(i);
         }
     }
+    spin_unlock_irqrestore(&pmm_lock, flags);
     return 0;  /* Out of memory */
 }
 
@@ -72,6 +77,7 @@ uint64_t pmm_alloc_pages(size_t count) {
     uint64_t consecutive = 0;
     uint64_t start = 0;
 
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
     for (uint64_t i = 0; i < total_pages; i++) {
         if (!bitmap_test(i)) {
             if (consecutive == 0) start = i;
@@ -81,21 +87,25 @@ uint64_t pmm_alloc_pages(size_t count) {
                     bitmap_set(j);
                 }
                 free_page_count -= count;
+                spin_unlock_irqrestore(&pmm_lock, flags);
                 return pmm_page_to_phys(start);
             }
         } else {
             consecutive = 0;
         }
     }
+    spin_unlock_irqrestore(&pmm_lock, flags);
     return 0;  /* No contiguous block found */
 }
 
 void pmm_free_page(uint64_t phys) {
+    uint64_t flags = spin_lock_irqsave(&pmm_lock);
     uint64_t page = pmm_phys_to_page(phys);
     if (page < total_pages && bitmap_test(page)) {
         bitmap_clear(page);
         free_page_count++;
     }
+    spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 void pmm_free_pages(uint64_t phys, size_t count) {
@@ -133,18 +143,20 @@ void pmm_init_e820(uint64_t entry_count, e820_entry_t *entries) {
         entries = fallback;
     }
 
-    /* Find highest address to size the bitmap */
+    /* Size the bitmap from the highest *available* RAM address only.  Reserved
+     * / ACPI / MMIO regions can sit very high in the physical space; sizing the
+     * bitmap to them would waste enormous amounts of memory, so we ignore them
+     * here (they are simply never handed out because they are never marked
+     * free below). */
     uint64_t highest_addr = 0;
     for (uint64_t i = 0; i < entry_count; i++) {
+        if (entries[i].type != E820_TYPE_AVAILABLE) continue;
         uint64_t end = entries[i].base + entries[i].length;
         if (end > highest_addr) highest_addr = end;
     }
-
-    /* Cap at 128MB to avoid huge bitmaps from high reserved regions */
-    if (highest_addr > 0x8000000ULL) {
-        serial_printf(SERIAL_COM1,
-            "[PMM] High reserved regions detected, capping to 128 MB\n");
-        highest_addr = 0x8000000ULL;
+    if (highest_addr == 0) {
+        /* No usable region reported; fall back to 32 MB. */
+        highest_addr = 0x2000000ULL;
     }
 
     highest_page = pmm_phys_to_page(highest_addr);
@@ -183,22 +195,21 @@ void pmm_init_e820(uint64_t entry_count, e820_entry_t *entries) {
     uint64_t kernel_end = pmm_align_up((uint64_t)__bss_end);
     pmm_mark_used(kernel_start, (kernel_end - kernel_start) / PAGE_SIZE);
 
-    /* Mark page 0 as used (real mode IDT, BIOS data) */
-    pmm_mark_used(0x0000, 1);
+    /* Reserve the entire low 2 MB.  This covers the real-mode IVT/BIOS data,
+     * the bootloader page tables, the e820 buffer, the boot sector, AND the SMP
+     * AP trampoline (0x8000) and its parameter block (0x9000).  Keeping all
+     * allocations at >= 2 MB also avoids handing out the first physmap huge
+     * page, which is shared with the boot identity window. */
+    pmm_mark_used(0x0, 512);
 
-    /* Mark bootloader page tables as used (0x1000 - 0x3FFF) */
-    pmm_mark_used(0x1000, 3);  /* 3 pages: PML4, PDPT, PD */
-
-    /* Mark e820 buffer and count as used (0x4000 - 0x66FF) */
-    pmm_mark_used(0x4000, 1);  /* 0x4000-0x4FFF */
-    pmm_mark_used(0x5000, 1);  /* 0x5000-0x5FFF */
-    pmm_mark_used(0x6000, 2);  /* 0x6000-0x7FFF (e820 buffer + padding) */
-
-    /* Mark boot sector and stack area as used (0x7C00 - 0x9FFFF) */
-    pmm_mark_used(0x7000, 1);  /* 0x7000-0x7FFF covers boot sector */
-
-    /* Mark stack region as used (0x300000 - 0x30FFFF, 64KB stack) */
-    pmm_mark_used(0x300000, 16);
+    /* Reserve the boot/idle kernel stack.  entry.asm sets RSP = 0x300000 and the
+     * stack grows DOWNWARD, so the live stack memory is the 64 KB *below* the
+     * top: [0x2F0000, 0x300000).  (Reserving [0x300000, 0x310000) here was a
+     * latent bug: it protected the wrong direction, leaving the real stack pages
+     * free for pmm_alloc_pages to hand out as thread stacks / page tables, which
+     * silently corrupted the idle thread's stack and cascaded into page-table
+     * corruption - notably zeroing the LAPIC PD entry, faulting the APs.) */
+    pmm_mark_used(0x2F0000, 16);
 
     /* Mark the bitmap pages themselves as used */
     uint64_t bitmap_pages = (bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;

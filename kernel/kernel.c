@@ -12,16 +12,106 @@
 #include "kapi.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "mm.h"
 #include "vfs.h"
 #include "block.h"
 #include "ata.h"
 #include "fat32.h"
 #include "ext4.h"
 #include "sched.h"
+#include "gdt.h"
+#include "syscall.h"
+#include "process.h"
+#include "acpi.h"
+#include "lapic.h"
+#include "ioapic.h"
+#include "smp.h"
+#include "net.h"
+#include "crypt_lite.h"
+#include "gfx.h"
+
+/* Embedded userspace init binary */
+extern uint8_t _userspace_init_start[];
+extern uint8_t _userspace_init_end[];
+
+/* setuid-root helpers written into the ramfs at boot (see m10_setup). */
+extern uint8_t _prog_su_start[];
+extern uint8_t _prog_su_end[];
+extern uint8_t _prog_passwd_start[];
+extern uint8_t _prog_passwd_end[];
 
 #define PROMPT "lariat> "
 
 static void shell_thread(void *arg);
+void smp_demo(void);
+void smp_stress(void);
+
+/* --------------------------------------------------------------------------
+ * M10: lay down the multi-user world at boot.
+ *
+ * Creates /etc/passwd + /etc/shadow (with crypt-lite hashes for the default
+ * accounts) and installs setuid-root /bin/su and /bin/passwd into the ramfs so
+ * the set-user-ID-on-exec path has real, owned, mode-bearing inodes to act on.
+ * -------------------------------------------------------------------------- */
+static void m10_str_append(char *dst, size_t cap, size_t *off, const char *s) {
+    while (*s && *off + 1 < cap) dst[(*off)++] = *s++;
+    dst[*off] = '\0';
+}
+
+static void m10_write_file(const char *path, const void *data, size_t len,
+                           uint32_t mode, uint32_t uid, uint32_t gid) {
+    struct vfs_file *f = vfs_open(path, O_CREAT | O_WRONLY | O_TRUNC);
+    if (!f) {
+        serial_printf(SERIAL_COM1, "[M10] failed to create %s\n", path);
+        return;
+    }
+    if (len) vfs_write(f, data, len);
+    if (f->inode) {
+        f->inode->mode = mode;
+        f->inode->uid = uid;
+        f->inode->gid = gid;
+    }
+    vfs_close(f);
+}
+
+static void m10_setup(void) {
+    vfs_mkdir("/etc", 0755);
+    vfs_mkdir("/bin", 0755);
+    vfs_mkdir("/home", 0755);
+    vfs_mkdir("/home/root", 0755);
+    vfs_mkdir("/home/user", 0755);
+
+    /* Default accounts: root (uid 0, password "root") and an unprivileged
+     * user (uid 1000, password "user"). */
+    static const char passwd_txt[] =
+        "root:x:0:0:root:/home/root:/bin/sh\n"
+        "user:x:1000:1000:user:/home/user:/bin/sh\n";
+    m10_write_file("/etc/passwd", passwd_txt, sizeof(passwd_txt) - 1,
+                   S_IFREG | 0644, 0, 0);
+
+    char hroot[64], huser[64];
+    crypt_lite("root", "rt", hroot, sizeof(hroot));
+    crypt_lite("user", "us", huser, sizeof(huser));
+
+    char shadow[256];
+    size_t off = 0;
+    m10_str_append(shadow, sizeof(shadow), &off, "root:");
+    m10_str_append(shadow, sizeof(shadow), &off, hroot);
+    m10_str_append(shadow, sizeof(shadow), &off, ":\nuser:");
+    m10_str_append(shadow, sizeof(shadow), &off, huser);
+    m10_str_append(shadow, sizeof(shadow), &off, ":\n");
+    m10_write_file("/etc/shadow", shadow, off, S_IFREG | 0600, 0, 0);
+
+    /* setuid-root helper binaries. */
+    m10_write_file("/bin/su", _prog_su_start,
+                   (size_t)(_prog_su_end - _prog_su_start),
+                   S_IFREG | S_ISUID | 0755, 0, 0);
+    m10_write_file("/bin/passwd", _prog_passwd_start,
+                   (size_t)(_prog_passwd_end - _prog_passwd_start),
+                   S_IFREG | S_ISUID | 0755, 0, 0);
+
+    serial_print(SERIAL_COM1, "[M10] multi-user world initialised\n");
+}
 
 static void print(const char *str) {
     vga_print(str);
@@ -220,19 +310,28 @@ void kmain(void) {
     print("  Project Lariat 64-bit Kernel  \n");
     print("================================\n\n");
 
+    /* Memory management must come first: build the direct map (physmap) so the
+     * heap and everything downstream can use phys_to_virt().
+     *
+     * We deliberately do NOT identity-map all of RAM: the boot loader's low
+     * 4MB identity map covers the kernel image, its stack and the PMM bitmap,
+     * and everything else is reached through the physmap.  Identity-mapping all
+     * RAM would collide with the user address space (e.g. USER_CODE_START at
+     * 1GB) once the machine has >= 1GB of RAM. */
+    vmm_init();
+    vmm_build_physmap();
+
     /* Initialize kernel subsystems */
     kapi_heap_init((void *)0x200000, 0x100000);
     module_init();
     device_init();
     driver_init();
 
-    vmm_init();
-    vmm_expand_identity_mapping();
-
     block_init();
     ata_init();
 
     vfs_init();
+    console_init();
     ramfs_init();
     fat32_init();
     ext4_init();
@@ -244,27 +343,172 @@ void kmain(void) {
     vfs_mkdir("/ext4", 0755);
     vfs_mount("ext4", "hdc", "/ext4");
 
+    /* Create a test file in ramfs for userspace I/O testing */
+    struct vfs_file *testf = vfs_open("/hello.txt", O_CREAT | O_WRONLY);
+    if (testf) {
+        const char *msg = "Hello from ramfs!\n";
+        vfs_write(testf, msg, 18);
+        vfs_close(testf);
+    }
+
+    /* M10: users, /etc/passwd + /etc/shadow, setuid helpers. */
+    m10_setup();
+
+    gdt_init();
+    tss_init();
+
     pic_init();
     idt_init();
+    syscall_init();
     timer_init(100);
+    clock_init();
     keyboard_init();
+
+    /* Discover CPUs / APIC topology and enable the local APIC + IO-APIC. */
+    acpi_init();
+    lapic_init();
+    ioapic_init();
 
     pci_init();
     driver_probe_all();
 
-    pic_clear_mask(0);
-    pic_clear_mask(1);
+    /* Bring up application processors (no-op on a single-CPU machine).  This
+     * also registers the LAPIC timer/IPI handlers on the shared IDT. */
+    smp_init();
+
+    /* Switch the whole system from the legacy 8259 PIC/PIT to the APIC:
+     *   - route the keyboard (ISA IRQ1 -> GSI1) through the IO-APIC to the BSP,
+     *   - mask both PICs entirely,
+     *   - acknowledge all interrupts at the local APIC (idt apic mode),
+     *   - drive the BSP's preemptive scheduler from its local APIC timer
+     *     instead of the PIT. */
+    uint8_t bsp_id = (uint8_t)lapic_id();
+    ioapic_route(1, 33, bsp_id);
+    /* Route COM1 (IRQ4 -> GSI4) to vector 36 so serial input is interrupt
+     * driven; this keeps a piped/serial console from dropping bytes. */
+    ioapic_route(4, 36, bsp_id);
+    /* Route the PS/2 mouse (IRQ12 -> GSI12) to vector 44 for the GUI. */
+    ioapic_route(12, 44, bsp_id);
+    keyboard_register_serial();
+    serial_enable_rx_interrupt(SERIAL_COM1);
+    pic_disable();
+    idt_set_apic_mode(1);
+    lapic_timer_init(VEC_LAPIC_TIMER, 10000000);
 
     __asm__ __volatile__("sti");
 
+    /* M11 GUI bring-up: unified input queue, framebuffer, PS/2 mouse. */
+    input_init();
+    bochs_vbe_init();
+    mouse_init();
+
+    smp_demo();
+    smp_stress();
+
     /* Start scheduler */
     scheduler_init();
-    thread_create((void (*)(void *))shell_thread, NULL);
 
-    /* Idle loop */
-    while (1) {
-        __asm__ __volatile__("hlt");
+    /* Bring up networking: core (loopback + RX dispatch thread) then the NIC. */
+    net_init();
+    rtl8139_init();
+
+    /* Create the init process.  It loads through the ELF path inside its own
+     * address space (see thread_trampoline), so .bss is mapped and a proper
+     * argv/envp stack is built. */
+    serial_print(SERIAL_COM1, "[KERNEL] Loading userspace init (/init)...\n");
+    struct thread *init_proc = process_create_user("/init");
+    if (!init_proc) {
+        serial_print(SERIAL_COM1, "[KERNEL] Failed to create user process, falling back to kernel shell\n");
+        thread_create((void (*)(void *))shell_thread, NULL);
+    } else {
+        /* init adopts orphaned processes (PID 1 semantics). */
+        sched_set_reaper(init_proc);
     }
+
+    /* Yield to the init process (cooperative scheduler) */
+    thread_yield();
+
+    /* Idle loop: also drain any SMP work so the BSP participates. */
+    while (1) {
+        smp_run_pending_work();
+        __asm__ __volatile__("sti; hlt");
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * SMP demo: schedule parallel jobs across all online cores
+ * -------------------------------------------------------------------------- */
+static spinlock_t smp_demo_lock = SPINLOCK_INIT;
+
+static void smp_demo_job(void *arg) {
+    int id = (int)(long)arg;
+    uint64_t flags = spin_lock_irqsave(&smp_demo_lock);
+    serial_printf(SERIAL_COM1, "[SMP] job %d ran on lapic id %d\n",
+                  id, (int)lapic_id());
+    spin_unlock_irqrestore(&smp_demo_lock, flags);
+}
+
+void smp_demo(void) {
+    if (smp_cpu_count() <= 1) {
+        serial_print(SERIAL_COM1, "[SMP] demo skipped (1 CPU)\n");
+        return;
+    }
+    serial_printf(SERIAL_COM1, "[SMP] dispatching 24 jobs across %d CPUs\n",
+                  smp_cpu_count());
+    for (int i = 0; i < 24; i++) {
+        smp_enqueue_work(smp_demo_job, (void *)(long)i);
+    }
+    /* Give the APs a chance to grab their share before the BSP drains the rest,
+     * so the work is visibly distributed across cores. */
+    for (volatile int spin = 0; spin < 2000000; spin++) {
+        __asm__ __volatile__("pause");
+    }
+    smp_run_pending_work();
+}
+
+/* --------------------------------------------------------------------------
+ * SMP stress: hammer the PMM concurrently from every core and verify that the
+ * free-page count returns to its starting value (catches lost pages and
+ * pmm_lock corruption).  Each allocation is touched through the direct map,
+ * which also validates physmap access from the application processors.
+ * -------------------------------------------------------------------------- */
+#define PMM_STRESS_ITERS 4000
+static volatile int pmm_stress_remaining;
+
+static void pmm_stress_job(void *arg) {
+    (void)arg;
+    for (int i = 0; i < PMM_STRESS_ITERS; i++) {
+        uint64_t p = pmm_alloc_page();
+        if (p) {
+            *(volatile uint64_t *)phys_to_virt(p) = p ^ 0xA5A5A5A5ULL;
+            pmm_free_page(p);
+        }
+    }
+    __sync_fetch_and_sub(&pmm_stress_remaining, 1);
+}
+
+void smp_stress(void) {
+    uint64_t before = pmm_get_free_count();
+    int jobs = (int)smp_cpu_count() * 4;
+    if (jobs < 4) jobs = 4;
+
+    pmm_stress_remaining = jobs;
+    for (int i = 0; i < jobs; i++) {
+        smp_enqueue_work(pmm_stress_job, 0);
+    }
+    /* BSP joins in, then waits for every job to finish. */
+    while (pmm_stress_remaining > 0) {
+        smp_run_pending_work();
+        __asm__ __volatile__("pause");
+    }
+
+    uint64_t after = pmm_get_free_count();
+    serial_printf(SERIAL_COM1,
+                  "[STRESS] pmm %d jobs x %d alloc/free across %d core(s): "
+                  "free before=%d after=%d %s\n",
+                  jobs, PMM_STRESS_ITERS, (int)smp_cpu_count(),
+                  (int)before, (int)after,
+                  before == after ? "OK" : "*** LEAK/CORRUPTION ***");
 }
 
 /* --------------------------------------------------------------------------

@@ -4,6 +4,8 @@
 #include "idt.h"
 #include "pic.h"
 #include "pmm.h"
+#include "vmm.h"
+#include "mm.h"
 #include <stdarg.h>
 
 /* --------------------------------------------------------------------------
@@ -82,9 +84,10 @@ void free_irq(uint8_t irq) {
                           ((s) <= 1024) ? 6 : 7)
 #define BUCKET_SIZE(i)   (16 << (i))
 
-#define MAX_TRACKED_PAGES 32768  /* 128MB / 4KB */
-#define PAGE_FREE    -1
-#define PAGE_LARGE   -2
+/* page_bucket[] markers (>= 0 means "bucket index of this page"). */
+#define PAGE_FREE        -1
+#define PAGE_LARGE       -2   /* first page of a multi-page large allocation */
+#define PAGE_LARGE_CONT  -3   /* continuation page of a large allocation */
 
 typedef struct free_obj {
     struct free_obj *next;
@@ -97,7 +100,11 @@ typedef struct {
 } bucket_t;
 
 static bucket_t buckets[NUM_BUCKETS];
-static int8_t   page_bucket[MAX_TRACKED_PAGES];
+
+/* Per-physical-page ownership table, sized dynamically to total RAM and
+ * allocated from the PMM (no more fixed 128MB ceiling). */
+static int8_t    *page_bucket   = NULL;
+static uint64_t   tracked_pages = 0;
 static spinlock_t kmalloc_lock = SPINLOCK_INIT;
 
 void kapi_heap_init(void *start, size_t size) {
@@ -108,9 +115,17 @@ void kapi_heap_init(void *start, size_t size) {
         buckets[i].obj_size = BUCKET_SIZE(i);
         buckets[i].objs_per_page = PAGE_SIZE / BUCKET_SIZE(i);
     }
-    for (size_t i = 0; i < MAX_TRACKED_PAGES; i++) {
+
+    /* Allocate the page ownership table from the PMM, one byte per page. */
+    tracked_pages = pmm_total_pages();
+    uint64_t bytes = tracked_pages;
+    uint64_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t phys = pmm_alloc_pages(pages);
+    page_bucket = (int8_t *)phys_to_virt(phys);
+    for (uint64_t i = 0; i < tracked_pages; i++) {
         page_bucket[i] = PAGE_FREE;
     }
+
     kmalloc_lock.locked = 0;
 }
 
@@ -127,10 +142,10 @@ static void *alloc_from_bucket(int bi) {
     uint64_t phys = pmm_alloc_page();
     if (!phys) return NULL;
 
-    char *page = (char *)phys;  /* identity mapped */
+    char *page = (char *)phys_to_virt(phys);
     size_t count = b->objs_per_page;
     uint64_t page_idx = phys / PAGE_SIZE;
-    page_bucket[page_idx] = (int8_t)bi;
+    if (page_idx < tracked_pages) page_bucket[page_idx] = (int8_t)bi;
 
     /* Link all objects into free list, chaining onto existing list */
     for (size_t i = 0; i < count - 1; i++) {
@@ -156,12 +171,15 @@ void *kmalloc(size_t size) {
 
     if (size > MAX_BLOCK_SIZE) {
         size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-        ptr = (void *)pmm_alloc_pages(pages);
-        if (ptr) {
-            uint64_t page_idx = (uint64_t)ptr / PAGE_SIZE;
-            for (size_t i = 0; i < pages && (page_idx + i) < MAX_TRACKED_PAGES; i++) {
-                page_bucket[page_idx + i] = PAGE_LARGE;
+        uint64_t phys = pmm_alloc_pages(pages);
+        if (phys) {
+            ptr = phys_to_virt(phys);
+            uint64_t page_idx = phys / PAGE_SIZE;
+            for (size_t i = 0; i < pages && (page_idx + i) < tracked_pages; i++) {
+                page_bucket[page_idx + i] = (i == 0) ? PAGE_LARGE : PAGE_LARGE_CONT;
             }
+        } else {
+            ptr = NULL;
         }
     } else {
         int bi = BUCKET_INDEX(size);
@@ -187,10 +205,10 @@ void kfree(void *ptr) {
     if (!ptr) return;
 
     uint64_t flags = spin_lock_irqsave(&kmalloc_lock);
-    uint64_t addr = (uint64_t)ptr;
-    uint64_t page_idx = addr / PAGE_SIZE;
+    uint64_t phys = virt_to_phys(ptr);
+    uint64_t page_idx = phys / PAGE_SIZE;
 
-    if (page_idx >= MAX_TRACKED_PAGES) {
+    if (page_idx >= tracked_pages) {
         spin_unlock_irqrestore(&kmalloc_lock, flags);
         return;
     }
@@ -199,14 +217,20 @@ void kfree(void *ptr) {
 
     if (bi >= 0 && bi < NUM_BUCKETS) {
         /* Bucket allocation: return to free list */
-        free_obj_t *obj = (free_obj_t *)addr;
+        free_obj_t *obj = (free_obj_t *)ptr;
         obj->next = buckets[bi].free_list;
         buckets[bi].free_list = obj;
     } else if (bi == PAGE_LARGE) {
-        /* Large allocation: for now, single-page large allocs only */
-        /* TODO: track page count for multi-page large allocations */
-        pmm_free_page(addr);
-        page_bucket[page_idx] = PAGE_FREE;
+        /* Large allocation: free the head page plus all continuation pages. */
+        uint64_t i = page_idx;
+        page_bucket[i] = PAGE_FREE;
+        pmm_free_page(pmm_page_to_phys(i));
+        i++;
+        while (i < tracked_pages && page_bucket[i] == PAGE_LARGE_CONT) {
+            page_bucket[i] = PAGE_FREE;
+            pmm_free_page(pmm_page_to_phys(i));
+            i++;
+        }
     }
 
     spin_unlock_irqrestore(&kmalloc_lock, flags);
@@ -217,11 +241,11 @@ void kfree(void *ptr) {
  * -------------------------------------------------------------------------- */
 void *alloc_pages(size_t count) {
     uint64_t phys = pmm_alloc_pages(count);
-    return phys ? (void *)phys : NULL;
+    return phys ? phys_to_virt(phys) : NULL;
 }
 
 void free_pages(void *ptr, size_t count) {
-    if (ptr) pmm_free_pages((uint64_t)ptr, count);
+    if (ptr) pmm_free_pages(virt_to_phys(ptr), count);
 }
 
 /* --------------------------------------------------------------------------
@@ -232,27 +256,36 @@ void *dma_alloc(size_t size, uint64_t *phys_out) {
     uint64_t phys = pmm_alloc_pages(pages);
     if (!phys) return NULL;
     if (phys_out) *phys_out = phys;
-    return (void *)phys;
+    return phys_to_virt(phys);
 }
 
 void dma_free(void *ptr, size_t size) {
-    (void)size;
-    if (ptr) pmm_free_page((uint64_t)ptr);
+    size_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (ptr) pmm_free_pages(virt_to_phys(ptr), pages);
 }
 
 /* --------------------------------------------------------------------------
  * MMIO / I/O mapping
+ *
+ * Map a physical (typically device MMIO) range into the kernel's direct-map
+ * window with caching disabled, and return a usable virtual pointer.  RAM is
+ * already covered by the physmap; this also handles MMIO ranges above RAM.
  * -------------------------------------------------------------------------- */
 void *ioremap(uint64_t phys, size_t size) {
-    (void)size;
-    /* For now: identity mapped region, just return phys */
-    /* TODO: proper page table mapping when we have VMM fully wired */
-    return (void *)(uintptr_t)phys;
+    uint64_t start = phys & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t end   = (phys + size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    for (uint64_t p = start; p < end; p += PAGE_SIZE) {
+        vmm_map_page((uint64_t)PHYSMAP_BASE + p, p, PT_WRITABLE | PT_NOCACHE);
+    }
+    return (void *)((uint64_t)PHYSMAP_BASE + phys);
 }
 
 void iounmap(void *virt, size_t size) {
-    (void)virt;
-    (void)size;
+    uint64_t start = (uint64_t)virt & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t end   = ((uint64_t)virt + size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    for (uint64_t v = start; v < end; v += PAGE_SIZE) {
+        vmm_unmap_page(v);
+    }
 }
 
 /* --------------------------------------------------------------------------

@@ -4,6 +4,7 @@
 #include "block.h"
 #include "serial.h"
 #include "kapi.h"
+#include "mm.h"
 #include "pci.h"
 #include <string.h>
 
@@ -256,30 +257,44 @@ static int ata_dma_transfer(ata_dev_t *dev, uint64_t lba, void *buf,
     if (!dev->lba48 && (lba + count > dev->sectors || lba > 0x0FFFFFFF))
         return -1;
 
-    /* Build PRDT: single entry for the whole transfer */
-    uint32_t phys = (uint32_t)(uint64_t)buf;  /* identity mapped */
+    /* Build PRDT: single entry for the whole transfer.  Bus-master IDE PRD
+     * entries are 32-bit physical addresses, so the DMA target must live below
+     * 4GB.  Translate the (direct-mapped) buffer to its physical address and,
+     * if it sits above 4GB, route the transfer through a low bounce buffer. */
     uint16_t bytes = (uint16_t)(count * 512);
-    if (bytes == 0) bytes = 0;  /* 0 means 64KB, but we limit to 256 sectors = 128KB */
+    uint64_t buf_phys = virt_to_phys(buf);
 
-    ata_prdt.phys_addr = phys;
+    void *bounce = NULL;
+    uint64_t dma_phys = buf_phys;
+    if (buf_phys + bytes > 0x100000000ULL) {
+        bounce = dma_alloc(bytes, &dma_phys);
+        if (!bounce) return -1;
+        if (dma_phys + bytes > 0x100000000ULL) {
+            /* Still no low memory available for DMA. */
+            dma_free(bounce, bytes);
+            return -1;
+        }
+        if (is_write) memcpy(bounce, buf, bytes);
+    }
+
+    ata_prdt.phys_addr = (uint32_t)dma_phys;
     ata_prdt.byte_count = bytes;
     ata_prdt.flags = PRDT_FLAG_EOT;
 
     /* Program BMIDE */
-    uint32_t prdt_phys = (uint32_t)(uint64_t)&ata_prdt;
+    uint32_t prdt_phys = (uint32_t)virt_to_phys(&ata_prdt);
     bmide_write(dev, BMIDE_CMD, 0);
     bmide_write(dev, BMIDE_STATUS, bmide_read(dev, BMIDE_STATUS) | 0x06); /* clear INT+ERR */
     outl(dev->bmide + BMIDE_PRDT, prdt_phys);
 
+    int result = 0;
     uint8_t cmd;
     if (dev->lba48) {
         cmd = is_write ? ATA_CMD_WRITE_DMA_EXT : ATA_CMD_READ_DMA_EXT;
-        if (ata_issue_cmd_lba48(dev, cmd, lba, (uint16_t)count) < 0)
-            return -1;
+        if (ata_issue_cmd_lba48(dev, cmd, lba, (uint16_t)count) < 0) { result = -1; goto out; }
     } else {
         cmd = is_write ? ATA_CMD_WRITE_DMA : ATA_CMD_READ_DMA;
-        if (ata_issue_cmd(dev, cmd, lba, (uint8_t)count) < 0)
-            return -1;
+        if (ata_issue_cmd(dev, cmd, lba, (uint8_t)count) < 0) { result = -1; goto out; }
     }
 
     /* Start DMA */
@@ -303,17 +318,21 @@ static int ata_dma_transfer(ata_dev_t *dev, uint64_t lba, void *buf,
 
     if (timeout <= 0) {
         serial_printf(SERIAL_COM1, "[ATA] DMA timeout\n");
-        return -1;
-    }
-    if (bmstat & BMIDE_STAT_DMA_ERR) {
+        result = -1;
+    } else if (bmstat & BMIDE_STAT_DMA_ERR) {
         serial_printf(SERIAL_COM1, "[ATA] DMA error (bmstat=0x%x status=0x%x)\n", bmstat, status);
-        return -1;
-    }
-    if (status & ATA_STAT_ERR) {
+        result = -1;
+    } else if (status & ATA_STAT_ERR) {
         serial_printf(SERIAL_COM1, "[ATA] ATA error after DMA (status=0x%x)\n", status);
-        return -1;
+        result = -1;
     }
-    return 0;
+
+out:
+    if (bounce) {
+        if (result == 0 && !is_write) memcpy(buf, bounce, bytes);
+        dma_free(bounce, bytes);
+    }
+    return result;
 }
 
 int ata_read_sectors_dma(ata_dev_t *dev, uint64_t lba, void *buf, size_t count) {

@@ -1,11 +1,53 @@
 #include "vfs.h"
 #include "kapi.h"
 #include "serial.h"
+#include "sched.h"
+#include "errno.h"
 #include <string.h>
 
 /* Current root filesystem */
 static struct vfs_dentry *vfs_root = NULL;
 static struct vfs_fs_type *fs_types = NULL;
+
+/* --------------------------------------------------------------------------
+ * M10: permission enforcement.  Compares the calling thread's effective
+ * credentials against an inode's owner/group/other rwx bits.  uid 0 (root)
+ * bypasses every check.  Returns 0 if allowed, -EACCES otherwise.
+ * -------------------------------------------------------------------------- */
+int vfs_permission(struct vfs_inode *inode, int mask) {
+    if (!inode) return -ENOENT;
+    if (mask == 0) return 0;
+
+    struct thread *t = current_thread();
+    /* No user context (early boot / kernel threads) acts as root. */
+    if (!t || t->euid == 0) {
+        /* Root may read/write anything; for exec at least one x bit must be
+         * set (mirrors POSIX so non-executable files still fail for root). */
+        if (mask & MAY_EXEC) {
+            if (inode->mode & (S_IXUSR | S_IXGRP | S_IXOTH)) return 0;
+            return -EACCES;
+        }
+        return 0;
+    }
+
+    uint32_t mode = inode->mode;
+    uint32_t perms;
+    if (t->euid == inode->uid) {
+        perms = (mode & S_IRWXU) >> 6;
+    } else {
+        int in_group = (t->egid == inode->gid);
+        for (int i = 0; !in_group && i < t->ngroups; i++)
+            if (t->groups[i] == inode->gid) in_group = 1;
+        if (in_group) perms = (mode & S_IRWXG) >> 3;
+        else          perms = (mode & S_IRWXO);
+    }
+
+    int want = 0;
+    if (mask & MAY_READ)  want |= 4;
+    if (mask & MAY_WRITE) want |= 2;
+    if (mask & MAY_EXEC)  want |= 1;
+    return ((perms & want) == want) ? 0 : -EACCES;
+}
 
 /* --------------------------------------------------------------------------
  * Utility functions
@@ -229,6 +271,45 @@ struct vfs_dentry *vfs_get_root(void) {
 /* --------------------------------------------------------------------------
  * File operations
  * -------------------------------------------------------------------------- */
+/* Resolve a path the way vfs_open() will and check the calling thread's
+ * credentials against the requested access.  Returns 0 if the open should be
+ * permitted, or a negative errno (-EACCES / -ENOENT) otherwise.  Kept separate
+ * from vfs_open() so in-kernel opens (ELF loader, console, config files) are
+ * not subject to userspace permission checks. */
+int vfs_access_check(const char *path, int flags) {
+    int acc = flags & 0x3;
+    int want = 0;
+    if (acc == O_RDONLY || acc == O_RDWR) want |= MAY_READ;
+    if (acc == O_WRONLY || acc == O_RDWR) want |= MAY_WRITE;
+    if (flags & O_TRUNC) want |= MAY_WRITE;
+
+    struct vfs_dentry *dentry = vfs_lookup_path(path);
+    if (dentry && dentry->inode)
+        return vfs_permission(dentry->inode, want);
+
+    if (flags & O_CREAT) {
+        /* Creating a new file needs write+search on the parent directory. */
+        char name[64];
+        struct vfs_dentry *parent = vfs_lookup_parent(path, name, sizeof(name));
+        if (!parent || !parent->inode) return -ENOENT;
+        return vfs_permission(parent->inode, MAY_WRITE | MAY_EXEC);
+    }
+    return -ENOENT;
+}
+
+int vfs_devfs_register(const char *name, struct vfs_inode *inode) {
+    struct vfs_dentry *dev = vfs_lookup_path("/dev");
+    if (!dev) {
+        vfs_mkdir("/dev", 0755);
+        dev = vfs_lookup_path("/dev");
+    }
+    if (!dev) return -1;
+    struct vfs_dentry *d = vfs_dentry_create(name, inode, dev);
+    if (!d) return -1;
+    vfs_dentry_add_child(dev, d);
+    return 0;
+}
+
 struct vfs_file *vfs_open(const char *path, int flags) {
     struct vfs_dentry *dentry = vfs_lookup_path(path);
 
@@ -254,16 +335,30 @@ struct vfs_file *vfs_open(const char *path, int flags) {
     file->inode = dentry->inode;
     file->pos = 0;
     file->flags = flags;
+    file->ref_count = 1;
 
-    if ((flags & O_TRUNC) && file->inode->f_ops && file->inode->f_ops->write) {
-        file->inode->size = 0;
+    if ((flags & O_TRUNC) && file->inode->f_ops) {
+        if (file->inode->f_ops->truncate)
+            file->inode->f_ops->truncate(file, 0);
+        else if (file->inode->f_ops->write)
+            file->inode->size = 0;
     }
+
+    /* O_APPEND: start writing at end-of-file. */
+    if (flags & O_APPEND)
+        file->pos = (off_t)file->inode->size;
 
     return file;
 }
 
 int vfs_close(struct vfs_file *file) {
     if (!file) return -1;
+    /* Shared handles (dup/fork) are only torn down once the last reference is
+     * dropped. */
+    if (file->ref_count > 1) {
+        file->ref_count--;
+        return 0;
+    }
     if (file->inode && file->inode->f_ops && file->inode->f_ops->close) {
         file->inode->f_ops->close(file);
     }
@@ -281,6 +376,21 @@ ssize_t vfs_write(struct vfs_file *file, const void *buf, size_t count) {
     if (!file || !file->inode || !file->inode->f_ops || !file->inode->f_ops->write)
         return -1;
     return file->inode->f_ops->write(file, buf, count);
+}
+
+int vfs_ioctl(struct vfs_file *file, unsigned long req, unsigned long arg) {
+    if (!file || !file->inode) return -9 /* EBADF */;
+    if (file->inode->f_ops && file->inode->f_ops->ioctl)
+        return file->inode->f_ops->ioctl(file, req, arg);
+    return -25 /* ENOTTY */;
+}
+
+short vfs_poll(struct vfs_file *file, short events) {
+    if (!file || !file->inode) return POLLNVAL;
+    if (file->inode->f_ops && file->inode->f_ops->poll)
+        return file->inode->f_ops->poll(file, events);
+    /* Regular files / devices without a poll op are always ready. */
+    return events & (POLLIN | POLLOUT);
 }
 
 off_t vfs_lseek(struct vfs_file *file, off_t offset, int whence) {

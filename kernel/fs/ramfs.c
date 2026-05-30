@@ -159,21 +159,31 @@ static struct vfs_file_ops ramfs_file_ops = {
 /* --------------------------------------------------------------------------
  * RAMFS inode (directory) operations
  * -------------------------------------------------------------------------- */
-static struct vfs_dentry *ramfs_lookup(struct vfs_inode *dir, const char *name) {
-    if (!dir) return NULL;
-    struct vfs_dentry *dentry = vfs_dentry_find_child(dir->sb->root, name);
-    /* Recursively search if needed */
-    if (!dentry && dir->sb->root) {
-        struct vfs_dentry *child = dir->sb->root->child_list;
-        while (child) {
-            if (child->inode && S_ISDIR(child->inode->mode)) {
-                dentry = vfs_dentry_find_child(child, name);
-                if (dentry) break;
-            }
-            child = child->next_sibling;
-        }
+/* Locate the dentry that owns `inode` by walking the dentry tree from the
+ * superblock root.  Lookups, creates and directory ops must all resolve the
+ * parent *by identity* - searching globally by name (as an earlier version did)
+ * makes same-named files in different directories (e.g. /etc/passwd vs
+ * /bin/passwd) alias to whichever the search happened to hit first. */
+static struct vfs_dentry *ramfs_dentry_for(struct vfs_dentry *d,
+                                           struct vfs_inode *inode) {
+    if (!d) return NULL;
+    if (d->inode == inode) return d;
+    for (struct vfs_dentry *c = d->child_list; c; c = c->next_sibling) {
+        struct vfs_dentry *r = ramfs_dentry_for(c, inode);
+        if (r) return r;
     }
-    return dentry;
+    return NULL;
+}
+
+static struct vfs_dentry *ramfs_parent_dentry(struct vfs_inode *dir) {
+    if (!dir || !dir->sb || !dir->sb->root) return NULL;
+    return ramfs_dentry_for(dir->sb->root, dir);
+}
+
+static struct vfs_dentry *ramfs_lookup(struct vfs_inode *dir, const char *name) {
+    struct vfs_dentry *parent = ramfs_parent_dentry(dir);
+    if (!parent) return NULL;
+    return vfs_dentry_find_child(parent, name);
 }
 
 static int ramfs_create(struct vfs_inode *dir, const char *name, uint32_t mode) {
@@ -182,15 +192,8 @@ static int ramfs_create(struct vfs_inode *dir, const char *name, uint32_t mode) 
     struct vfs_inode *inode = ramfs_create_vinode(dir->sb, mode);
     if (!inode) return -1;
 
-    struct vfs_dentry *parent = dir->sb->root;
-    /* Try to find the actual parent dentry for nested paths */
-    if (dir->sb->root && dir->sb->root->inode != dir) {
-        struct vfs_dentry *c = dir->sb->root->child_list;
-        while (c) {
-            if (c->inode == dir) { parent = c; break; }
-            c = c->next_sibling;
-        }
-    }
+    struct vfs_dentry *parent = ramfs_parent_dentry(dir);
+    if (!parent) parent = dir->sb->root;
 
     struct vfs_dentry *dentry = vfs_dentry_create(name, inode, parent);
     if (!dentry) {
@@ -206,16 +209,8 @@ static int ramfs_mkdir(struct vfs_inode *dir, const char *name, uint32_t mode) {
 }
 
 static int ramfs_unlink(struct vfs_inode *dir, const char *name) {
-    if (!dir || !dir->sb || !dir->sb->root) return -1;
-
-    struct vfs_dentry *parent = dir->sb->root;
-    if (dir->sb->root->inode != dir) {
-        struct vfs_dentry *c = dir->sb->root->child_list;
-        while (c) {
-            if (c->inode == dir) { parent = c; break; }
-            c = c->next_sibling;
-        }
-    }
+    struct vfs_dentry *parent = ramfs_parent_dentry(dir);
+    if (!parent) return -1;
 
     struct vfs_dentry *child = vfs_dentry_find_child(parent, name);
     if (!child || !child->inode) return -1;
@@ -228,16 +223,8 @@ static int ramfs_unlink(struct vfs_inode *dir, const char *name) {
 }
 
 static int ramfs_rmdir(struct vfs_inode *dir, const char *name) {
-    if (!dir || !dir->sb || !dir->sb->root) return -1;
-
-    struct vfs_dentry *parent = dir->sb->root;
-    if (dir->sb->root->inode != dir) {
-        struct vfs_dentry *c = dir->sb->root->child_list;
-        while (c) {
-            if (c->inode == dir) { parent = c; break; }
-            c = c->next_sibling;
-        }
-    }
+    struct vfs_dentry *parent = ramfs_parent_dentry(dir);
+    if (!parent) return -1;
 
     struct vfs_dentry *child = vfs_dentry_find_child(parent, name);
     if (!child || !child->inode) return -1;
@@ -251,16 +238,8 @@ static int ramfs_rmdir(struct vfs_inode *dir, const char *name) {
 }
 
 static int ramfs_readdir(struct vfs_inode *dir, int index, struct vfs_dir_entry *entry) {
-    if (!dir || !dir->sb || !dir->sb->root) return -1;
-
-    struct vfs_dentry *parent = dir->sb->root;
-    if (dir->sb->root->inode != dir) {
-        struct vfs_dentry *c = dir->sb->root->child_list;
-        while (c) {
-            if (c->inode == dir) { parent = c; break; }
-            c = c->next_sibling;
-        }
-    }
+    struct vfs_dentry *parent = ramfs_parent_dentry(dir);
+    if (!parent) return -1;
 
     struct vfs_dentry *child = parent->child_list;
     int idx = 0;

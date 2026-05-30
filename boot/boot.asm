@@ -24,16 +24,21 @@ start:
     ; Query e820 memory map
     call query_e820
 
-    ; Load kernel from disk (sectors 2-129 = 128 sectors = 64KB) to 0x7E00
-    mov ah, 0x02
-    mov al, KERNEL_SECTORS
-    mov ch, 0
-    mov cl, 2
-    mov dh, 0
+    ; Load the kernel via LBA (INT 13h AH=42h) extended reads.  The kernel image
+    ; now exceeds the old 127-sector CHS limit, so we read it in 16 KB chunks
+    ; (32 sectors), advancing the destination segment and LBA each iteration.
+    mov cx, KERNEL_CHUNKS
+.load_loop:
+    push cx
+    mov si, dap
+    mov ah, 0x42
     mov dl, [boot_drive]
-    mov bx, KERNEL_OFFSET
     int 0x13
     jc disk_error
+    add word [dap_seg], 0x400        ; advance 16 KB (0x4000 >> 4)
+    add dword [dap_lba], 32          ; advance 32 sectors
+    pop cx
+    loop .load_loop
 
     ; Switch to 32-bit protected mode
     cli
@@ -113,8 +118,8 @@ protected_mode_32:
     ; Copy kernel from 0x7E00 to 0x100000 (1MB)
     mov esi, KERNEL_OFFSET
     mov edi, KERNEL_TARGET
-    mov ecx, KERNEL_SIZE
-    rep movsb
+    mov ecx, KERNEL_SIZE / 4
+    rep movsd
 
     ; Set up identity paging with 2MB huge pages (first 4MB)
     ; Clear page table area (0x1000 - 0x4FFF)
@@ -193,6 +198,19 @@ msg_loading:    db "Lariat: loading kernel...", 0x0D, 0x0A, 0
 msg_disk_error: db "Lariat: disk error!", 0
 boot_drive:     db 0
 
+; Disk Address Packet for INT 13h AH=42h (LBA extended read).
+align 4
+dap:
+    db 0x10              ; packet size
+    db 0                 ; reserved
+    dw 32                ; sectors to read per call (16 KB)
+    dw 0                 ; transfer buffer offset
+dap_seg:
+    dw 0x07E0            ; transfer buffer segment (0x7E00 linear)
+dap_lba:
+    dd 1                 ; starting LBA (kernel begins right after the boot sector)
+    dd 0
+
 E820_COUNT_ADDR  equ 0x6000
 E820_BUFFER      equ 0x6010
 E820_MAX_ENTRIES equ 64
@@ -228,8 +246,9 @@ DATA64_SEG equ gdt64_data - gdt32_start
 ; ---------------------------------------------------------------------------
 KERNEL_OFFSET  equ 0x7E00
 KERNEL_TARGET  equ 0x100000
-KERNEL_SIZE    equ 65536           ; 64KB max
-KERNEL_SECTORS equ 127             ; 127 * 512 = 65024 (some BIOS limit)
+KERNEL_CHUNKS  equ 32               ; 32 chunks * 32 sectors = 1024 sectors
+KERNEL_SIZE    equ 1024 * 512       ; 512 KB load window (copied to 1 MB)
+KERNEL_SECTORS equ 1024
 
 ; Boot signature
  times 510-($-$$) db 0

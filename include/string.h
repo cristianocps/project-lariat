@@ -32,6 +32,9 @@ static inline void *memmove(void *dest, const void *src, size_t n) {
     return dest;
 }
 
+/* Defined in kernel/kapi.c (kept non-inline to match its existing definition). */
+extern int memcmp(const void *a, const void *b, size_t n);
+
 static inline size_t strlen(const char *s) {
     size_t len = 0;
     while (s[len]) len++;

@@ -1,6 +1,14 @@
 #include "serial.h"
 #include "ports.h"
+#include "kapi.h"
 #include <stdarg.h>
+
+/* Serializes whole-message output so concurrent writers (SMP kernel threads and
+ * the userspace console) don't interleave or drop bytes by racing on the THR. */
+static spinlock_t serial_lock = SPINLOCK_INIT;
+
+uint64_t serial_lock_acquire(void) { return spin_lock_irqsave(&serial_lock); }
+void     serial_lock_release(uint64_t f) { spin_unlock_irqrestore(&serial_lock, f); }
 
 void serial_init(uint16_t port) {
     outb(port + 1, 0x00);    // Disable all interrupts
@@ -14,6 +22,13 @@ void serial_init(uint16_t port) {
 
 int serial_received(uint16_t port) {
     return inb(port + 5) & 1;
+}
+
+/* Enable the "received data available" interrupt (IER bit 0) so incoming bytes
+ * raise IRQ4 (COM1) instead of being lost in the 1-byte register when host
+ * input arrives faster than we poll. */
+void serial_enable_rx_interrupt(uint16_t port) {
+    outb(port + 1, 0x01);
 }
 
 char serial_getc(uint16_t port) {
@@ -30,10 +45,16 @@ void serial_putc(uint16_t port, char c) {
     outb(port, c);
 }
 
-void serial_print(uint16_t port, const char *str) {
+static void serial_print_nolock(uint16_t port, const char *str) {
     while (*str) {
         serial_putc(port, *str++);
     }
+}
+
+void serial_print(uint16_t port, const char *str) {
+    uint64_t f = spin_lock_irqsave(&serial_lock);
+    serial_print_nolock(port, str);
+    spin_unlock_irqrestore(&serial_lock, f);
 }
 
 static void serial_print_dec(uint16_t port, int64_t value) {
@@ -69,6 +90,7 @@ static void serial_print_hex(uint16_t port, uint64_t value, int digits) {
 }
 
 void serial_vprintf(uint16_t port, const char *fmt, va_list args) {
+    uint64_t lf = spin_lock_irqsave(&serial_lock);
     for (const char *p = fmt; *p; p++) {
         if (*p != '%') {
             serial_putc(port, *p);
@@ -94,6 +116,9 @@ void serial_vprintf(uint16_t port, const char *fmt, va_list args) {
                     serial_print_dec(port, va_arg(args, long));
                 } else if (*p == 'x') {
                     serial_print_hex(port, va_arg(args, unsigned long), 16);
+                } else if (*p == 'l' && *(p+1) == 'd') {
+                    p++;
+                    serial_print_dec(port, va_arg(args, long long));
                 } else if (*p == 'l' && *(p+1) == 'x') {
                     p++;
                     serial_print_hex(port, va_arg(args, unsigned long long), 16);
@@ -103,12 +128,14 @@ void serial_vprintf(uint16_t port, const char *fmt, va_list args) {
                 serial_print_hex(port, va_arg(args, unsigned int), 8);
                 break;
             case 'p':
-                serial_print(port, "0x");
+                serial_print_nolock(port, "0x");
                 serial_print_hex(port, va_arg(args, uintptr_t), 16);
                 break;
-            case 's':
-                serial_print(port, va_arg(args, char *));
+            case 's': {
+                char *sarg = va_arg(args, char *);
+                serial_print_nolock(port, sarg ? sarg : "(null)");
                 break;
+            }
             case 'c':
                 serial_putc(port, va_arg(args, int));
                 break;
@@ -121,6 +148,7 @@ void serial_vprintf(uint16_t port, const char *fmt, va_list args) {
                 break;
         }
     }
+    spin_unlock_irqrestore(&serial_lock, lf);
 }
 
 void serial_printf(uint16_t port, const char *fmt, ...) {

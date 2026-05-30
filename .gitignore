@@ -13,10 +13,20 @@ build/
 # Downloaded packages
 *.deb
 
+# Local runtime dependencies (QEMU libs fetched/extracted locally)
+.local_libs/
+
 # Debug / core files
 *.log
 core
 *.core
+
+# QEMU screendumps / captures
+*.ppm
+
+# Patch / merge backups
+*.orig
+*.rej
 
 # Editor / OS junk
 *.swp

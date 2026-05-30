@@ -15,6 +15,8 @@ typedef struct {
 typedef void (*isr_t)(registers_t *);
 
 void idt_init(void);
+void idt_load_ap(void);
+void idt_set_apic_mode(int on);
 void idt_set_gate(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags);
 void register_interrupt_handler(uint8_t n, isr_t handler);
 

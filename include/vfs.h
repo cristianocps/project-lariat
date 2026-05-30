@@ -37,13 +37,37 @@ struct vfs_file;
 struct vfs_superblock;
 struct vfs_fs_type;
 
+/* poll(2)/select(2) readiness event bits (Linux-compatible). */
+#define POLLIN   0x0001
+#define POLLPRI  0x0002
+#define POLLOUT  0x0004
+#define POLLERR  0x0008
+#define POLLHUP  0x0010
+#define POLLNVAL 0x0020
+
 /* File operations (per-open-file) */
 struct vfs_file_ops {
     ssize_t (*read)(struct vfs_file *file, void *buf, size_t count);
     ssize_t (*write)(struct vfs_file *file, const void *buf, size_t count);
     int     (*close)(struct vfs_file *file);
     off_t   (*lseek)(struct vfs_file *file, off_t offset, int whence);
+    /* Return the subset of `events` (plus POLLHUP/POLLERR) that are ready
+     * right now without blocking.  NULL means "always readable+writable". */
+    short   (*poll)(struct vfs_file *file, short events);
+    /* Device control; returns 0/positive or negative errno. */
+    int     (*ioctl)(struct vfs_file *file, unsigned long req, unsigned long arg);
+    /* Truncate the file to `length` bytes (optional). */
+    int     (*truncate)(struct vfs_file *file, off_t length);
+    /* Map the device's pages into the calling process at user_va for length
+     * bytes (used by /dev/fb0).  Returns 0 or negative errno.  NULL means the
+     * file is not mmappable. */
+    int     (*mmap)(struct vfs_file *file, uint64_t user_va, size_t length,
+                    uint64_t prot);
 };
+
+/* Query readiness of an open file (returns ready event mask). */
+short vfs_poll(struct vfs_file *file, short events);
+int   vfs_ioctl(struct vfs_file *file, unsigned long req, unsigned long arg);
 
 /* Directory entry for readdir */
 struct vfs_dir_entry {
@@ -68,11 +92,39 @@ struct vfs_inode {
     uint32_t               mode;        /* file type + permissions */
     uint32_t               size;
     uint32_t               nlink;
+    uint32_t               uid;         /* owning user  (M10) */
+    uint32_t               gid;         /* owning group (M10) */
     struct vfs_superblock *sb;
     struct vfs_inode_ops  *i_ops;
     struct vfs_file_ops   *f_ops;
     void                  *private_data;
 };
+
+/* Permission bits (mode & 0777) and the set-user/group-ID bits. */
+#define S_ISUID 0x800
+#define S_ISGID 0x400
+#define S_IRWXU 0x1C0
+#define S_IRUSR 0x100
+#define S_IWUSR 0x080
+#define S_IXUSR 0x040
+#define S_IRWXG 0x038
+#define S_IRGRP 0x020
+#define S_IWGRP 0x010
+#define S_IXGRP 0x008
+#define S_IRWXO 0x007
+#define S_IROTH 0x004
+#define S_IWOTH 0x002
+#define S_IXOTH 0x001
+
+/* Access modes for vfs_permission(). */
+#define MAY_EXEC  0x1
+#define MAY_WRITE 0x2
+#define MAY_READ  0x4
+
+/* Check the current thread's credentials against an inode (root bypasses).
+ * Returns 0 if allowed, negative errno otherwise. */
+int vfs_permission(struct vfs_inode *inode, int mask);
+int vfs_access_check(const char *path, int flags);
 
 /* Dentry - directory entry, maps a name to an inode */
 struct vfs_dentry {
@@ -90,6 +142,8 @@ struct vfs_file {
     struct vfs_inode      *inode;
     off_t                  pos;
     uint32_t               flags;
+    int                    ref_count;   /* shared across dup()/fork() */
+    void                  *private_data; /* e.g. pipe state */
 };
 
 /* Superblock - represents a mounted filesystem instance */
@@ -145,6 +199,17 @@ struct vfs_dentry *vfs_get_root(void);
 
 /* Filesystem initializers */
 void ramfs_init(void);
+
+/* Console device (/dev/console) backing stdin/stdout/stderr */
+void console_init(void);
+struct vfs_file *console_open(void);
+
+/* Anonymous pipe: fills files[0]=read end, files[1]=write end */
+int pipe_create(struct vfs_file **files);
+
+/* Install a static char-device inode at /dev/<name> (creating /dev on first
+ * use).  Used by the framebuffer and input drivers. */
+int vfs_devfs_register(const char *name, struct vfs_inode *inode);
 
 /* Dentry helpers */
 struct vfs_dentry *vfs_dentry_create(const char *name, struct vfs_inode *inode,
