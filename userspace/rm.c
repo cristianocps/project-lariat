@@ -8,10 +8,12 @@
 #include "libc/sys/stat.h"
 
 static int recursive = 0;
+static int force = 0;
 
 static int rm_path(const char *path) {
     struct stat st;
     if (stat(path, &st) < 0) {
+        if (force) return 0;   /* -f: ignore nonexistent operands */
         fprintf(STDERR_FILENO, "rm: %s: error %d\n", path, errno);
         return 1;
     }
@@ -48,16 +50,21 @@ static int rm_path(const char *path) {
 int main(int argc, char **argv) {
     int rc = 0, files = 0;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "-rf") == 0 ||
-            strcmp(argv[i], "-R") == 0) {
-            recursive = 1;
+        /* Accept any combination of -r/-R (recursive) and -f (force) flags,
+         * e.g. -f, -r, -rf, -fr, -Rf.  Makefiles lean on `rm -f` heavily. */
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            for (const char *c = &argv[i][1]; *c; c++) {
+                if (*c == 'r' || *c == 'R') recursive = 1;
+                else if (*c == 'f') force = 1;
+            }
             continue;
         }
         files++;
         rc |= rm_path(argv[i]);
     }
     if (!files) {
-        fputs("usage: rm [-r] FILE...\n", STDERR_FILENO);
+        if (force) return 0;   /* `rm -f` with no operands is a no-op success */
+        fputs("usage: rm [-rf] FILE...\n", STDERR_FILENO);
         return 1;
     }
     return rc;

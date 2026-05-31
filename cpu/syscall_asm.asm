@@ -105,13 +105,19 @@ syscall_entry:
     ; Rearrange syscall args (Linux x86_64 convention -> SysV ABI).
     ; User passed: RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5, R9=a6
     ; C handler:  RDI=nr, RSI=a1, RDX=a2, RCX=a3, R8=a4, R9=a5, stack=a6
+    ; The handler has SEVEN parameters, so a6 must be passed on the stack as the
+    ; 7th argument.  r9 (which held a6) gets reused for a5, so source a6 from its
+    ; saved slot.  An 8-byte pad keeps rsp 16-byte aligned across the call.
     mov  r9, r8                 ; a5 -> r9
     mov  r8, r10                ; a4 -> r8
     mov  rcx, rdx               ; a3 -> rcx
     mov  rdx, rsi               ; a2 -> rdx
     mov  rsi, rdi               ; a1 -> rsi
     mov  rdi, [r15 + TH_SYSCALL_NR] ; nr -> rdi
+    sub  rsp, 8                  ; alignment pad (keep 16-byte alignment)
+    push qword [r15 + TH_USR_R9] ; a6 -> 7th arg on the stack
     call syscall_handler
+    add  rsp, 16                 ; drop a6 + pad
 
     ; Restore all saved registers (reverse order)
     pop r15

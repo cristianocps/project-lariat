@@ -173,14 +173,15 @@ phase is the hard prerequisite for bash and every interactive tool.
 Make the system able to build software *on itself*.
 - **7a — gcc compiles & runs a program on device** ✅. The native
   `binutils`/`gcc` (+ `libc-dev` sysroot) packages install on `/var` via `lpkg`,
-  and `gcc` compiles a C source to a working executable that runs on Lariat:
+  and `gcc` compiles a C source to a working executable that runs on Lariat —
+  with the **LTO linker plugin enabled** (gcc's default, no special flags):
 
   ```
-  gcc -fno-use-linker-plugin /var/test.c -o /tmp/prog && /tmp/prog
+  gcc /var/test.c -o /tmp/prog && /tmp/prog
   HELLO_FROM_LARIAT_GCC rc=42
   ```
 
-  Closing this exposed and fixed four foundational gaps (see `adr/0016`):
+  Closing this exposed and fixed six foundational gaps (see `adr/0016`):
   1. **Linux-ABI `struct stat`** — the syscall ABI is now byte-for-byte Linux
      x86_64 (`st_nlink` before `st_mode`, full 144-byte layout). The musl
      toolchain was reading `st_mode` from the wrong offset, so `cc1` rejected
@@ -195,16 +196,33 @@ Make the system able to build software *on itself*.
      linked binaries failed `execve` with `EACCES`.
   4. **`libgcc` packaged** — `crt{begin,end}*.o`, `libgcc.a`, `libgcc_eh.a`,
      `libgcc_s.so*` are now in the gcc `.lpkg`; the link step needs them.
+  5. **6th syscall argument** — the syscall entry stub never passed argument 6
+     to the C handler (it read the thread pointer instead), so `mmap`'s `offset`
+     was garbage. Any runtime `dlopen` then mapped a file of zeros and crashed;
+     this is why the **LTO plugin** appeared to need `dlopen` support — `dlopen`
+     already worked, the file offset was just wrong.
+  6. **`execve` argv limit** — argv was capped at 31 entries. Enabling the LTO
+     plugin makes `collect2` drive `ld` with ~45 arguments, so the *trailing*
+     `crtendS.o`/`crtn.o` were silently dropped → `hidden symbol __TMC_END__
+     isn't defined`. The limit is now 512 args / 128 KiB.
 
-  *Known limitations (tracked for Phase 6d / later 7):* the **LTO linker
-  plugin** needs runtime `dlopen` (not yet supported), so links currently pass
-  `-fno-use-linker-plugin`; **`-static`** produces a low-address `ET_EXEC` that
-  collides with kernel memory (dynamic PIE is the working path); and `g++`
-  (`libstdc++`) is deferred.
-- **7b — rebuild gcc itself on device** 🔜 (the full `adr/0012` loop).
-- Bring up **GNU `make`**, **`pkg-config`**, and the **autotools `configure`**
-  path on device (the `sh` + coreutils + `sed`/`grep`/`awk` + fork/exec/pipe/wait
-  chain), plus `m4`/`diffutils` as `configure` needs them.
+  *Known limitations (tracked for later phases):* **`-static`** produces a
+  low-address `ET_EXEC` that collides with kernel memory (dynamic PIE is the
+  working path); and `g++` (`libstdc++`) is deferred.
+- **7b — rebuild gcc itself on device** 🚧 (the full `adr/0012` loop). The
+  compiler now builds and links arbitrary C programs on device, and **GNU `make`
+  drives multi-step `gcc` builds** (see below); the remaining work is the
+  autotools `configure` chain, then the full `gcc`-rebuilds-`gcc` bootstrap.
+- **GNU `make` is up** ✅ (`adr/0017`). Cross-built and packaged as
+  `make-<ver>.lpkg` (dynamic PIE, deps `libc-dev`); a bare `make` builds a
+  multi-file project on device (`gcc -c` per source, link, `make clean`). This
+  required fixing a latent kernel gap: the VFS only accepted absolute paths, so
+  **relative paths are now resolved against the process cwd** at the syscall
+  boundary (`open`/`stat`/`unlink`/`rename`/`execve`/…) — the norm for builds
+  (`cc -c main.c`). The in-tree `rm` also learned `-f` (ubiquitous in recipes).
+- Still to bring up: **`pkg-config`** and the **autotools `configure`** path
+  (a capable `sh` + coreutils + `sed`/`grep`/`awk` + fork/exec/pipe/wait chain),
+  plus `m4`/`diffutils` as `configure` needs them.
 
 ### Phase 8 — GNU userland (the milestone) 🔜
 Build on device and package as `lpkg`, installing to `/usr`: **coreutils, bash,

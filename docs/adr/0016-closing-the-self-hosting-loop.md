@@ -12,7 +12,7 @@ Phase 7a is the first *real* proof: install the native `binutils`, `gcc`, and a
 working executable that runs on Lariat.
 
 Driving the real GNU `gcc` end-to-end (rather than the in-tree `lcc`) exposed
-four foundational gaps. The toolchain is `x86_64-linux-musl`: it produces
+six foundational gaps. The toolchain is `x86_64-linux-musl`: it produces
 Linux-ABI binaries and its libc (musl) assumes the **Linux x86_64 syscall ABI**.
 Lariat already used Linux syscall *numbers* and a Linux-compatible `dirent64`,
 but had diverged on a few structures and behaviors that only a full compiler
@@ -30,6 +30,10 @@ Symptoms observed, in the order they unblocked:
 3. With the driver fixed, the link stage crashed inside `ld` while loading the
    LTO plugin, and after side-stepping that, freshly linked binaries refused to
    `execve` ("command not found" / `EACCES`).
+4. With those resolved (`-fno-use-linker-plugin`), enabling the LTO plugin (the
+   gcc default) crashed `ld` inside the musl loader's `sysv_lookup`, and once
+   that was understood, the plugin link failed with `hidden symbol __TMC_END__
+   isn't defined`.
 
 ## Decision
 
@@ -63,6 +67,27 @@ Treat the syscall ABI as **byte-for-byte Linux x86_64** (the whole point of the
    `toolchain/build/gcc/x86_64-linux-musl/libgcc/`) are installed into the
    native tree and collected into the gcc `.lpkg`; the link step requires them.
 
+5. **Syscall argument 6 reaches the C handler.** `syscall_handler` takes seven
+   parameters (`nr` + `a1..a6`), so `a6` must be passed on the stack per the
+   SysV ABI. The entry stub (`cpu/syscall_asm.asm`) shuffled `a1..a5` into the
+   ABI registers but never placed `a6` on the stack — the handler read it from
+   the pushed thread pointer instead. `mmap`'s `offset` (argument 6) was
+   therefore always garbage, so the first runtime `dlopen` mapped a library full
+   of zeros (its dynamic/hash tables read as NULL → null-deref in the loader's
+   `sysv_lookup`). The fix pushes the saved `a6` as the 7th argument with an
+   8-byte pad to preserve 16-byte stack alignment. (This means `dlopen` was never
+   actually missing — it was a file-offset bug — so symptom 3's plugin crash and
+   symptom 4's loader crash share this root cause.)
+
+6. **`execve` argv/envp limits raised (512 args / 128 KiB).** `setup_user_stack`
+   hard-capped argv at 31 entries (and `elf_execve` at 64). With the LTO plugin
+   enabled, `collect2` drives `ld` with ~45 arguments — ten `-plugin-opt=…`
+   entries up front and `crtendS.o`/`crtn.o` at the very end. Past argv[31] the
+   tail was silently dropped, so `crtendS.o` (which defines the hidden
+   `__TMC_END__` referenced by `crtbeginS.o`) never reached `ld`. The pointer
+   vectors are now heap-allocated (folded into the `argbuf` allocation and sized
+   per call) to keep them off the 8 KiB kernel stack.
+
 Secondary correctness fix found along the way: `clock_gettime` now maps the
 per-process / per-thread CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`,
 `CLOCK_THREAD_CPUTIME_ID`) to the monotonic source, so GCC's `timevar` deltas are
@@ -77,19 +102,22 @@ assertion when `cc1` was run standalone).
   lpkg install /var/pkgs/libc-dev-1.2.5.lpkg
   lpkg install /var/pkgs/binutils-2.42.lpkg
   lpkg install /var/pkgs/gcc-14.1.0.lpkg
-  gcc -fno-use-linker-plugin hello.c -o hello && ./hello
+  gcc hello.c -o hello && ./hello
   ```
 
-  `gcc` finds its own `cc1`/`as`/`ld` (no `-B` needed once `stat` is correct) and
-  the resulting dynamic PIE runs.
+  `gcc` finds its own `cc1`/`as`/`ld` (no `-B` needed once `stat` is correct),
+  the LTO linker plugin loads (no `-fno-use-linker-plugin`), and the resulting
+  dynamic PIE runs.
 
 - **Aligning the ABI to Linux is now an explicit invariant.** Any new
   kernel/userland shared structure must match the Linux x86_64 layout, not a
   convenient simplification, so imported musl/Linux-ABI binaries keep working.
 
+- **Runtime `dlopen` works.** Fixing argument 6 made the loader's `map_library`
+  read real file contents, so `ld` `dlopen`s `liblto_plugin.so` and the LTO
+  linker plugin is used by default — no `-fno-use-linker-plugin` needed.
+
 - **Known limitations (follow-ups):**
-  - The **LTO linker plugin** is `dlopen`ed by `ld`; runtime `dlopen` is not yet
-    supported (Phase 6d), so links pass `-fno-use-linker-plugin` for now.
   - **`-static`** yields a low-address `ET_EXEC` that collides with kernel
     memory; the dynamic PIE path is the working one until the loader grows a
     static-exec/static-PIE placement story.

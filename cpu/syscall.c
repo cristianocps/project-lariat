@@ -61,6 +61,26 @@ static int map_user_page(struct thread *t, uint64_t virt, uint64_t flags) {
     return 0;
 }
 
+/* Resolve a possibly-relative user path against the calling thread's current
+ * working directory.  Absolute paths are returned unchanged; relative paths are
+ * joined onto cwd into `buf` (vfs_walk() collapses any "."/".." components).
+ * The VFS only accepts absolute paths, so every path syscall must funnel user
+ * input through here or relative paths (the norm for builds: `cc -c main.c`)
+ * silently fail.  Returns NULL on a NULL input or buffer overflow. */
+static const char *cwd_join(const char *p, char *buf, size_t sz) {
+    if (!p) return NULL;
+    if (p[0] == '/') return p;
+    struct thread *t = current_thread();
+    const char *cwd = (t && t->cwd[0]) ? t->cwd : "/";
+    size_t cl = strlen(cwd), pl = strlen(p), off;
+    if (cl + 1 + pl + 1 > sz) return NULL;
+    memcpy(buf, cwd, cl); off = cl;
+    if (off == 0 || buf[off - 1] != '/') buf[off++] = '/';
+    memcpy(buf + off, p, pl); off += pl;
+    buf[off] = '\0';
+    return buf;
+}
+
 /* --------------------------------------------------------------------------
  * Process / file syscalls
  * -------------------------------------------------------------------------- */
@@ -234,7 +254,9 @@ static uint64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode,
     (void)a4; (void)a5; (void)a6; (void)mode;
     struct thread *t = current_thread();
     if (!t || !t->fdt) return -EINVAL;
-    const char *p = (const char *)(uintptr_t)path;
+    char pbuf[1024];
+    const char *p = cwd_join((const char *)(uintptr_t)path, pbuf, sizeof pbuf);
+    if (!p) return -ENOENT;
     int perr = vfs_access_check(p, (int)flags);
     if (perr == -EACCES) return -EACCES;
     int existed = ((flags & O_CREAT) && vfs_lookup_path(p) != NULL);
@@ -712,9 +734,11 @@ static void fill_stat(struct vfs_inode *inode, struct kstat *st) {
 static uint64_t sys_stat(uint64_t path, uint64_t statbuf, uint64_t a3,
                          uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    const char *p = (const char *)(uintptr_t)path;
     struct kstat *st = (struct kstat *)(uintptr_t)statbuf;
-    if (!p || !st) return -EFAULT;
+    if (!st) return -EFAULT;
+    char pbuf[1024];
+    const char *p = cwd_join((const char *)(uintptr_t)path, pbuf, sizeof pbuf);
+    if (!p) return -EFAULT;
     struct vfs_dentry *d = vfs_lookup_path(p);
     if (!d || !d->inode) return -ENOENT;
     fill_stat(d->inode, st);
@@ -846,7 +870,8 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t statbuf,
 static uint64_t sys_access(uint64_t path, uint64_t mode, uint64_t a3,
                            uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)mode; (void)a3; (void)a4; (void)a5; (void)a6;
-    const char *p = (const char *)(uintptr_t)path;
+    char pbuf[1024];
+    const char *p = cwd_join((const char *)(uintptr_t)path, pbuf, sizeof pbuf);
     if (!p) return -EFAULT;
     struct vfs_dentry *d = vfs_lookup_path(p);
     return (d && d->inode) ? 0 : -ENOENT;
@@ -951,7 +976,8 @@ static uint64_t sys_setrlimit(uint64_t resource, uint64_t rlim, uint64_t a3,
 static uint64_t sys_chmod(uint64_t path, uint64_t mode, uint64_t a3,
                           uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    const char *p = (const char *)(uintptr_t)path;
+    char pbuf[1024];
+    const char *p = cwd_join((const char *)(uintptr_t)path, pbuf, sizeof pbuf);
     if (!p) return -EFAULT;
     struct vfs_dentry *d = vfs_lookup_path(p);
     if (!d || !d->inode) return -ENOENT;
@@ -1005,9 +1031,11 @@ static uint64_t sys_fsync(uint64_t fd, uint64_t a2, uint64_t a3,
 static uint64_t sys_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz,
                              uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a4; (void)a5; (void)a6;
-    const char *p = (const char *)(uintptr_t)path;
     char *ubuf = (char *)(uintptr_t)buf;
-    if (!p || !ubuf) return -EFAULT;
+    if (!ubuf) return -EFAULT;
+    char pbuf[1024];
+    const char *p = cwd_join((const char *)(uintptr_t)path, pbuf, sizeof pbuf);
+    if (!p) return -EFAULT;
     int n = vfs_readlink(p, ubuf, (size_t)bufsiz);
     if (n < 0) {
         /* Distinguish "not a symlink" from "missing" for a useful errno. */
@@ -1021,7 +1049,8 @@ static uint64_t sys_symlink(uint64_t target, uint64_t linkpath, uint64_t a3,
                             uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
     const char *t = (const char *)(uintptr_t)target;
-    const char *l = (const char *)(uintptr_t)linkpath;
+    char lbuf[1024];
+    const char *l = cwd_join((const char *)(uintptr_t)linkpath, lbuf, sizeof lbuf);
     if (!t || !l) return -EFAULT;
     return vfs_symlink(t, l) == 0 ? 0 : -EIO;
 }
@@ -1031,8 +1060,9 @@ static uint64_t sys_symlink(uint64_t target, uint64_t linkpath, uint64_t a3,
 static uint64_t sys_rename(uint64_t oldp, uint64_t newp, uint64_t a3,
                            uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    const char *o = (const char *)(uintptr_t)oldp;
-    const char *n = (const char *)(uintptr_t)newp;
+    char obuf[1024], nbuf[1024];
+    const char *o = cwd_join((const char *)(uintptr_t)oldp, obuf, sizeof obuf);
+    const char *n = cwd_join((const char *)(uintptr_t)newp, nbuf, sizeof nbuf);
     if (!o || !n) return -EFAULT;
     struct vfs_dentry *d = vfs_lookup_path(o);
     if (!d || !d->inode) return -ENOENT;
@@ -1139,7 +1169,9 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
 static uint64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t a3,
                           uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    const char *p = (const char *)(uintptr_t)path;
+    char pbuf[1024];
+    const char *p = cwd_join((const char *)(uintptr_t)path, pbuf, sizeof pbuf);
+    if (!p) return -ENOENT;
     int r = vfs_mkdir(p, (uint32_t)mode);
     if (r == 0) {
         /* A new directory is owned by the creating user (so an unprivileged
@@ -1161,7 +1193,9 @@ static uint64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t a3,
 static uint64_t sys_rmdir(uint64_t path, uint64_t a2, uint64_t a3,
                           uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
-    const char *p = (const char *)(uintptr_t)path;
+    char pbuf[1024];
+    const char *p = cwd_join((const char *)(uintptr_t)path, pbuf, sizeof pbuf);
+    if (!p) return -ENOENT;
     int r = vfs_rmdir(p);
     return (r < 0) ? (uint64_t)-ENOENT : 0;
 }
@@ -1169,7 +1203,9 @@ static uint64_t sys_rmdir(uint64_t path, uint64_t a2, uint64_t a3,
 static uint64_t sys_unlink(uint64_t path, uint64_t a2, uint64_t a3,
                            uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
-    const char *p = (const char *)(uintptr_t)path;
+    char pbuf[1024];
+    const char *p = cwd_join((const char *)(uintptr_t)path, pbuf, sizeof pbuf);
+    if (!p) return -ENOENT;
     int r = vfs_unlink(p);
     return (r < 0) ? (uint64_t)-ENOENT : 0;
 }
@@ -1584,11 +1620,12 @@ static uint64_t sys_rt_sigreturn(uint64_t a1, uint64_t a2, uint64_t a3,
 static uint64_t sys_execve(uint64_t pathname, uint64_t argv, uint64_t envp,
                            uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a4; (void)a5; (void)a6;
-    const char *path = (const char *)(uintptr_t)pathname;
+    char pbuf[1024];
+    const char *path = cwd_join((const char *)(uintptr_t)pathname, pbuf, sizeof pbuf);
     (void)argv; (void)envp;
 
     struct thread *t = current_thread();
-    if (!t || !t->cr3) return -EINVAL;
+    if (!t || !t->cr3 || !path) return -EINVAL;
 
     extern int elf_execve(struct thread *t, const char *path,
                           char *const argv[], char *const envp[]);

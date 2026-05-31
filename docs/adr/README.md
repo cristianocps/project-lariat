@@ -21,3 +21,4 @@ starting point. Land an ADR in the same change as the code that implements it.
 | [0014](0014-executable-resolution-and-real-bin.md) | PATH-based executable resolution and a real /bin | Accepted |
 | [0015](0015-gnu-userland-and-buildable-portfolio.md) | Robust GNU userland and a self-hosted, buildable app portfolio | Accepted |
 | [0016](0016-closing-the-self-hosting-loop.md) | Closing the self-hosting loop (gcc compiles & runs on device) | Accepted |
+| [0017](0017-on-device-make-and-relative-paths.md) | On-device builds — GNU make and cwd-relative path resolution | Accepted |

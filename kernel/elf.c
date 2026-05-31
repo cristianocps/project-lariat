@@ -10,6 +10,15 @@
 #include "serial.h"
 #include <string.h>
 
+/* Initial-stack limits.  These are generous because real toolchains pass long
+ * argv lists: a single `gcc` link with the LTO linker plugin enabled drives
+ * `ld` with ~45 arguments (Scrt1.o, crt*.o, many -L/-l, plus ten
+ * `-plugin-opt=` entries) and a large argv+envp byte total.  Capping argv too
+ * low silently drops the *trailing* arguments (e.g. crtendS.o/crtn.o), which
+ * manifests far downstream as "hidden symbol `__TMC_END__' isn't defined". */
+#define EXEC_MAXARG 512
+#define EXEC_ARGBUF (128 * 1024)
+
 /* --------------------------------------------------------------------------
  * Minimal ELF64 loader + execve.
  *
@@ -288,11 +297,19 @@ static uint64_t setup_user_stack(struct thread *t, uint64_t stack_top,
     int argc = 0, envc = 0;
     if (argv) while (argv[argc]) argc++;
     if (envp) while (envp[envc]) envc++;
+    if (argc > EXEC_MAXARG) argc = EXEC_MAXARG;
+    if (envc > EXEC_MAXARG) envc = EXEC_MAXARG;
 
     uint64_t sp = stack_top;
-    uint64_t argp[32], envpp[32];
-    if (argc > 31) argc = 31;
-    if (envc > 31) envc = 31;
+    /* Heap-allocated: argc/envc can reach EXEC_MAXARG, far too large for the
+     * 8 KiB kernel stack. */
+    uint64_t *argp  = kmalloc((size_t)(argc + 1) * sizeof(uint64_t));
+    uint64_t *envpp = kmalloc((size_t)(envc + 1) * sizeof(uint64_t));
+    if (!argp || !envpp) {
+        if (argp) kfree(argp);
+        if (envpp) kfree(envpp);
+        return 0;
+    }
 
     for (int i = 0; i < envc; i++) {
         size_t l = strlen(envp[i]) + 1;
@@ -342,6 +359,8 @@ static uint64_t setup_user_stack(struct thread *t, uint64_t stack_top,
     stk[idx++] = AT_NULL;
     stk[idx++] = 0;
 
+    kfree(argp);
+    kfree(envpp);
     return (uint64_t)(uintptr_t)stk;
 }
 
@@ -529,12 +548,15 @@ int elf_execve(struct thread *t, const char *path,
      * address space: the user-supplied pointers (and the strings they point to)
      * live in the calling process's now-doomed pages, so we must copy them out
      * first and build the new initial stack from the kernel-resident copies. */
-#define EXEC_MAXARG 64
-#define EXEC_ARGBUF 4096
-    char *kargv[EXEC_MAXARG + 1];
-    char *kenvp[EXEC_MAXARG + 1];
-    char *argbuf = kmalloc(EXEC_ARGBUF);
+    /* One allocation holds the copied strings (first EXEC_ARGBUF bytes) plus
+     * the two pointer-vector arrays (kargv, kenvp) in its tail.  Folding the
+     * vectors into argbuf means every existing `kfree(argbuf)` site frees them
+     * too, and keeps these large arrays off the 8 KiB kernel stack. */
+    size_t vecbytes = (size_t)(EXEC_MAXARG + 1) * 2 * sizeof(char *);
+    char *argbuf = kmalloc(EXEC_ARGBUF + vecbytes);
     if (!argbuf) { if (heap_buf) kfree(heap_buf); return -ENOMEM; }
+    char **kargv = (char **)(argbuf + EXEC_ARGBUF);
+    char **kenvp = kargv + (EXEC_MAXARG + 1);
     size_t boff = 0;
     int kac = 0, kec = 0;
     if (argv) {

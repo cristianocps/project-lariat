@@ -17,6 +17,7 @@ export LARIAT_TARGET="x86_64-linux-musl"
 export BINUTILS_VER="${BINUTILS_VER:-2.42}"
 export GCC_VER="${GCC_VER:-14.1.0}"
 export MUSL_VER="${MUSL_VER:-1.2.5}"
+export MAKE_VER="${MAKE_VER:-4.4.1}"
 
 # Where everything lives. Build artifacts; all gitignored.
 export TC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
