@@ -8,7 +8,8 @@ QEMU    = LD_LIBRARY_PATH=/tmp/qemu-extract/usr/lib/x86_64-linux-gnu QEMU_MODULE
 CFLAGS  = -m64 -ffreestanding -Os -Wall -Wextra -nostdlib -nostartfiles \
           -fno-builtin -fno-exceptions -fno-stack-protector -nodefaultlibs \
           -mcmodel=large -fno-pie -fno-pic -mno-sse -mno-sse2 -mno-red-zone \
-          -fcf-protection=none -fno-unwind-tables -fno-asynchronous-unwind-tables -Iinclude \
+          -fcf-protection=none -fno-unwind-tables -fno-asynchronous-unwind-tables \
+          -Iinclude -Iinclude/uapi \
           -MMD -MP
 
 QEMU_FLAGS = -L /tmp/qemu-extract/usr/share/qemu -L /tmp/qemu-extract/usr/share/seabios
@@ -50,6 +51,7 @@ KERNEL_C   = kernel/kernel.c \
              kernel/fs/ramfs.c \
              kernel/fs/fat32.c \
              kernel/fs/ext4.c \
+             kernel/fs/procfs.c \
              kernel/net/pbuf.c \
              kernel/net/net.c \
              kernel/net/eth.c \
@@ -59,12 +61,16 @@ KERNEL_C   = kernel/kernel.c \
              kernel/net/udp.c \
              kernel/net/tcp.c \
              kernel/net/socket.c \
+             kernel/ipc/port.c \
              kernel/fork_return_log.c \
              kernel/input.c \
-             drivers/serial.c \
-             drivers/keyboard.c \
-             drivers/mouse.c \
-             drivers/ata.c \
+             kernel/core/world.c \
+             kernel/core/smptest.c \
+             kernel/core/kshell.c \
+             drivers/char/serial.c \
+             drivers/input/keyboard.c \
+             drivers/input/mouse.c \
+             drivers/block/ata.c \
              drivers/video/bochs_vbe.c \
              drivers/net/rtl8139.c \
              cpu/pic.c \
@@ -76,13 +82,13 @@ KERNEL_C   = kernel/kernel.c \
 KERNEL_OBJS = $(patsubst %.asm,$(BUILD_DIR)/%.o,$(KERNEL_ASM)) \
               $(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_C))
 
-.PHONY: all clean run run-headless run-gui run-desktop debug iso dirs
+.PHONY: all clean run run-headless run-gui run-desktop debug iso dirs disks sysroot
 .DEFAULT_GOAL := all
 
 all: dirs $(OS_BIN)
 
 dirs:
-	@mkdir -p $(BUILD_DIR)/kernel $(BUILD_DIR)/kernel/fs $(BUILD_DIR)/kernel/net $(BUILD_DIR)/drivers $(BUILD_DIR)/drivers/net $(BUILD_DIR)/drivers/video $(BUILD_DIR)/cpu
+	@mkdir -p $(BUILD_DIR)/kernel $(BUILD_DIR)/kernel/core $(BUILD_DIR)/kernel/fs $(BUILD_DIR)/kernel/net $(BUILD_DIR)/kernel/ipc $(BUILD_DIR)/drivers $(BUILD_DIR)/drivers/net $(BUILD_DIR)/drivers/video $(BUILD_DIR)/drivers/block $(BUILD_DIR)/drivers/input $(BUILD_DIR)/drivers/char $(BUILD_DIR)/cpu
 
 # Boot sector (flat binary, 512 bytes)
 $(BOOT_BIN): $(BOOT_SRC)
@@ -123,13 +129,28 @@ $(BUILD_DIR)/drivers/net/%.o: drivers/net/%.c
 $(BUILD_DIR)/drivers/video/%.o: drivers/video/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/drivers/block/%.o: drivers/block/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drivers/input/%.o: drivers/input/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/drivers/char/%.o: drivers/char/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/cpu/%.o: cpu/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kernel/core/%.o: kernel/core/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kernel/fs/%.o: kernel/fs/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kernel/net/%.o: kernel/net/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kernel/ipc/%.o: kernel/ipc/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Build all userspace programs (init + /bin programs) as ELF images.
@@ -143,7 +164,10 @@ userspace/echosrv.elf userspace/echocli.elf \
 userspace/true.elf userspace/false.elf userspace/clear.elf userspace/sleep.elf \
 userspace/mkdir.elf userspace/rmdir.elf userspace/rm.elf userspace/cp.elf \
 userspace/mv.elf userspace/wc.elf userspace/grep.elf userspace/head.elf \
-userspace/tail.elf userspace/ps.elf userspace/kill.elf: userspace-build
+userspace/tail.elf userspace/ps.elf userspace/kill.elf \
+userspace/id.elf userspace/whoami.elf userspace/login.elf userspace/su.elf \
+userspace/passwd.elf userspace/useradd.elf userspace/userdel.elf \
+userspace/settings.elf userspace/lcc.elf userspace/gui.elf userspace/lpkg.elf: userspace-build
 
 # Embedded /bin programs, each turned into a kernel object with its own symbols.
 PROG_OBJS = $(BUILD_DIR)/prog_sh.o $(BUILD_DIR)/prog_ls.o $(BUILD_DIR)/prog_cat.o \
@@ -160,7 +184,9 @@ PROG_OBJS = $(BUILD_DIR)/prog_sh.o $(BUILD_DIR)/prog_ls.o $(BUILD_DIR)/prog_cat.
             $(BUILD_DIR)/prog_kill.o $(BUILD_DIR)/prog_id.o \
             $(BUILD_DIR)/prog_whoami.o $(BUILD_DIR)/prog_login.o \
             $(BUILD_DIR)/prog_su.o $(BUILD_DIR)/prog_passwd.o \
-            $(BUILD_DIR)/prog_gui.o
+            $(BUILD_DIR)/prog_useradd.o $(BUILD_DIR)/prog_userdel.o \
+            $(BUILD_DIR)/prog_settings.o $(BUILD_DIR)/prog_lcc.o \
+            $(BUILD_DIR)/prog_gui.o $(BUILD_DIR)/prog_lpkg.o
 
 # Embed the init ELF (loaded through the ELF loader so .bss is mapped).
 $(BUILD_DIR)/userspace_init.o: userspace/init.elf
@@ -209,14 +235,16 @@ run: $(OS_BIN)
 	$(QEMU) $(QEMU_FLAGS) \
 		-drive format=raw,file=$(OS_BIN),if=ide,media=disk,bus=0,unit=0 \
 		-drive format=raw,file=disk.img,if=ide,media=disk,bus=0,unit=1 \
-		-drive format=raw,file=ext4.img,if=ide,media=disk,bus=1,unit=0 \
+		-drive id=ext4d,format=raw,file=ext4.img,if=none,cache=writethrough \
+		-device ide-hd,drive=ext4d,bus=ide.1,unit=0 \
 		-m 1024 $(NET_FLAGS)
 
 run-headless: $(OS_BIN)
 	$(QEMU) $(QEMU_FLAGS) \
 		-drive format=raw,file=$(OS_BIN),if=ide,media=disk,bus=0,unit=0 \
 		-drive format=raw,file=disk.img,if=ide,media=disk,bus=0,unit=1 \
-		-drive format=raw,file=ext4.img,if=ide,media=disk,bus=1,unit=0 \
+		-drive id=ext4d,format=raw,file=ext4.img,if=none,cache=writethrough \
+		-device ide-hd,drive=ext4d,bus=ide.1,unit=0 \
 		-m 1024 $(NET_FLAGS) -nographic -monitor none
 
 # GUI run: Bochs/std VGA framebuffer with a QMP monitor on a unix socket so the
@@ -226,7 +254,8 @@ run-gui: $(OS_BIN)
 	$(QEMU) $(QEMU_FLAGS) \
 		-drive format=raw,file=$(OS_BIN),if=ide,media=disk,bus=0,unit=0 \
 		-drive format=raw,file=disk.img,if=ide,media=disk,bus=0,unit=1 \
-		-drive format=raw,file=ext4.img,if=ide,media=disk,bus=1,unit=0 \
+		-drive id=ext4d,format=raw,file=ext4.img,if=none,cache=writethrough \
+		-device ide-hd,drive=ext4d,bus=ide.1,unit=0 \
 		-m 1024 $(NET_FLAGS) -vga std -display none \
 		-monitor unix:/tmp/lariat-mon.sock,server,nowait -serial stdio
 
@@ -240,7 +269,8 @@ run-desktop: $(OS_BIN)
 	$(QEMU) $(QEMU_FLAGS) \
 		-drive format=raw,file=$(OS_BIN),if=ide,media=disk,bus=0,unit=0 \
 		-drive format=raw,file=disk.img,if=ide,media=disk,bus=0,unit=1 \
-		-drive format=raw,file=ext4.img,if=ide,media=disk,bus=1,unit=0 \
+		-drive id=ext4d,format=raw,file=ext4.img,if=none,cache=writethrough \
+		-device ide-hd,drive=ext4d,bus=ide.1,unit=0 \
 		-m 1024 $(NET_FLAGS) -vga std -vnc :0 -serial mon:stdio
 
 debug: $(OS_BIN)
@@ -252,6 +282,16 @@ iso: $(OS_BIN)
 	printf 'set timeout=0\nset default=0\n\nmenuentry "Project Lariat" {\n    multiboot /boot/lariat.bin\n    boot\n}\n' > $(BUILD_DIR)/iso/boot/grub/grub.cfg
 	grub-mkrescue -o $(OS_ISO) $(BUILD_DIR)/iso 2>/dev/null || \
 		echo "grub-mkrescue failed (may need xorriso)"
+
+# Create the FAT32 (/disk) and ext4 (/ext4) data images if missing.
+# Disk images are build artifacts (gitignored); see scripts/mkdisk.sh.
+disks:
+	./scripts/mkdisk.sh
+
+# Seed the x86_64-lariat cross-toolchain sysroot from the public ABI headers.
+# Full toolchain build is driven by toolchain/*.sh (see toolchain/README.md).
+sysroot:
+	./toolchain/make-sysroot.sh
 
 clean:
 	rm -rf $(BUILD_DIR)

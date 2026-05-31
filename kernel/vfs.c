@@ -9,6 +9,40 @@
 static struct vfs_dentry *vfs_root = NULL;
 static struct vfs_fs_type *fs_types = NULL;
 
+/* Mount table: a record of each successful mount, for /proc/mounts and for
+ * fstab idempotency (so the parser does not re-mount what boot already did). */
+static struct vfs_mount_rec g_mounts[VFS_MAX_MOUNTS];
+static int g_mount_count = 0;
+
+static void mt_copy(char *dst, const char *src, size_t cap) {
+    size_t i = 0;
+    if (cap == 0) return;
+    if (src) for (; src[i] && i < cap - 1; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+static void vfs_mount_record(const char *fstype, const char *dev, const char *path) {
+    if (g_mount_count >= VFS_MAX_MOUNTS) return;
+    struct vfs_mount_rec *r = &g_mounts[g_mount_count++];
+    mt_copy(r->dev, (dev && dev[0]) ? dev : "none", sizeof(r->dev));
+    mt_copy(r->path, path ? path : "/", sizeof(r->path));
+    mt_copy(r->fstype, fstype, sizeof(r->fstype));
+}
+
+int vfs_mounts_count(void) { return g_mount_count; }
+
+const struct vfs_mount_rec *vfs_mounts_get(int i) {
+    if (i < 0 || i >= g_mount_count) return NULL;
+    return &g_mounts[i];
+}
+
+int vfs_is_mounted(const char *path) {
+    if (!path) return 0;
+    for (int i = 0; i < g_mount_count; i++)
+        if (strcmp(g_mounts[i].path, path) == 0) return 1;
+    return 0;
+}
+
 /* --------------------------------------------------------------------------
  * M10: permission enforcement.  Compares the calling thread's effective
  * credentials against an inode's owner/group/other rwx bits.  uid 0 (root)
@@ -130,14 +164,27 @@ void vfs_dentry_remove_child(struct vfs_dentry *parent, struct vfs_dentry *child
 /* --------------------------------------------------------------------------
  * Path resolution
  * -------------------------------------------------------------------------- */
-struct vfs_dentry *vfs_lookup_path(const char *path) {
-    if (!vfs_root) return NULL;
-    if (!path || path[0] == '\0') return NULL;
+#define VFS_SYMLINK_MAX_DEPTH 8
 
-    struct vfs_dentry *current = vfs_root;
+/* Read a symlink inode's target into buf (NUL-terminated); returns 0 or -1. */
+static int vfs_read_link_target(struct vfs_inode *inode, char *buf, size_t buflen) {
+    if (!inode || !inode->i_ops || !inode->i_ops->readlink || buflen == 0)
+        return -1;
+    int n = inode->i_ops->readlink(inode, buf, buflen - 1);
+    if (n < 0) return -1;
+    if ((size_t)n >= buflen) n = (int)buflen - 1;
+    buf[n] = '\0';
+    return 0;
+}
 
-    if (!is_absolute(path)) return NULL;
+/* Walk `path` (its components, leading slashes ignored) starting at `start`,
+ * following symbolic links encountered along the way.  `depth` bounds symlink
+ * recursion.  Returns the resolved dentry (mount points crossed) or NULL. */
+static struct vfs_dentry *vfs_walk(struct vfs_dentry *start, const char *path,
+                                   int depth) {
+    if (!start || depth > VFS_SYMLINK_MAX_DEPTH) return NULL;
 
+    struct vfs_dentry *current = start;
     const char *p = path;
     char comp[64];
 
@@ -151,26 +198,45 @@ struct vfs_dentry *vfs_lookup_path(const char *path) {
         if (!current->inode || !S_ISDIR(current->inode->mode))
             return NULL;
 
-        /* Follow mount points */
-        while (current && current->mount) {
+        /* Follow mount points before resolving inside this directory. */
+        while (current && current->mount)
             current = current->mount->root;
+
+        struct vfs_dentry *next;
+        if (current->inode->i_ops && current->inode->i_ops->lookup)
+            next = current->inode->i_ops->lookup(current->inode, comp);
+        else
+            next = vfs_dentry_find_child(current, comp);
+
+        if (!next) return NULL;
+
+        /* Symbolic link: resolve its target, then continue with the rest of
+         * the path from there (absolute targets restart at the root). */
+        if (next->inode && S_ISLNK(next->inode->mode)) {
+            char target[256];
+            if (vfs_read_link_target(next->inode, target, sizeof(target)) < 0)
+                return NULL;
+            struct vfs_dentry *base = (target[0] == '/') ? vfs_root : current;
+            current = vfs_walk(base, target, depth + 1);
+            if (!current) return NULL;
+            continue;
         }
 
-        if (current->inode->i_ops && current->inode->i_ops->lookup) {
-            current = current->inode->i_ops->lookup(current->inode, comp);
-        } else {
-            current = vfs_dentry_find_child(current, comp);
-        }
-
-        if (!current) return NULL;
+        current = next;
     }
 
-    /* Follow final mount point */
-    while (current && current->mount) {
+    /* Follow a final mount point so callers see the mounted fs root. */
+    while (current && current->mount)
         current = current->mount->root;
-    }
 
     return current;
+}
+
+struct vfs_dentry *vfs_lookup_path(const char *path) {
+    if (!vfs_root) return NULL;
+    if (!path || path[0] == '\0') return NULL;
+    if (!is_absolute(path)) return NULL;
+    return vfs_walk(vfs_root, path, 0);
 }
 
 struct vfs_dentry *vfs_lookup_parent(const char *path, char *name_out, size_t name_len) {
@@ -254,6 +320,7 @@ int vfs_mount(const char *fs_name, const char *dev_name, const char *path) {
 
     if (!vfs_root || (path && path[0] == '/' && path[1] == '\0')) {
         vfs_root = sb->root;
+        vfs_mount_record(fs_name, dev_name, "/");
         return 0;
     }
 
@@ -261,6 +328,7 @@ int vfs_mount(const char *fs_name, const char *dev_name, const char *path) {
     struct vfs_dentry *mnt = vfs_lookup_path(path);
     if (!mnt) return -1;
     mnt->mount = sb;
+    vfs_mount_record(fs_name, dev_name, path);
     return 0;
 }
 
@@ -427,6 +495,45 @@ int vfs_rmdir(const char *path) {
         !parent->inode->i_ops->rmdir)
         return -1;
     return parent->inode->i_ops->rmdir(parent->inode, name);
+}
+
+int vfs_symlink(const char *target, const char *linkpath) {
+    if (!target || !linkpath) return -1;
+    char name[64];
+    struct vfs_dentry *parent = vfs_lookup_parent(linkpath, name, sizeof(name));
+    if (!parent) return -1;
+    /* Cross a mount point at the parent (e.g. linkpath under /var). */
+    while (parent->mount) parent = parent->mount->root;
+    if (!parent->inode || !parent->inode->i_ops ||
+        !parent->inode->i_ops->symlink)
+        return -1;
+    return parent->inode->i_ops->symlink(parent->inode, name, target);
+}
+
+int vfs_readlink(const char *path, char *buf, size_t bufsiz) {
+    if (!path || !buf || bufsiz == 0) return -1;
+    /* Resolve the parent and the final component WITHOUT following a final
+     * symlink, so we can read the link itself rather than its target. */
+    char name[64];
+    struct vfs_dentry *parent = vfs_lookup_parent(path, name, sizeof(name));
+    if (!parent) return -1;
+    while (parent->mount) parent = parent->mount->root;
+    if (!parent->inode) return -1;
+    struct vfs_dentry *d;
+    if (parent->inode->i_ops && parent->inode->i_ops->lookup)
+        d = parent->inode->i_ops->lookup(parent->inode, name);
+    else
+        d = vfs_dentry_find_child(parent, name);
+    if (!d || !d->inode || !S_ISLNK(d->inode->mode)) return -1;
+    if (!d->inode->i_ops || !d->inode->i_ops->readlink) return -1;
+    return d->inode->i_ops->readlink(d->inode, buf, bufsiz);
+}
+
+int vfs_setattr(struct vfs_inode *inode) {
+    if (!inode) return -1;
+    if (inode->i_ops && inode->i_ops->setattr)
+        return inode->i_ops->setattr(inode);
+    return 0;   /* in-memory fs: the in-core inode is the source of truth */
 }
 
 /* --------------------------------------------------------------------------

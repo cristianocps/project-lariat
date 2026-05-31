@@ -201,6 +201,7 @@ struct thread *process_create_user(const char *path) {
     t->exec_path = path;
     t->cwd[0] = '/';
     t->cwd[1] = '\0';
+    t->umask = 022;   /* conventional default file-creation mask */
 
     t->fdt = fd_table_alloc();
     if (!t->fdt) {
@@ -275,6 +276,7 @@ struct thread *process_fork(struct thread *parent) {
     /* Copy fields from parent */
     memcpy(child, parent, sizeof(struct thread));
     child->tid = 0;
+    child->tgid = 0;   /* fork() makes a new process: tgid == tid at enqueue */
     child->state = THREAD_READY;
     child->next = NULL;
     child->parent = parent;
@@ -382,6 +384,10 @@ struct thread *process_clone(struct thread *parent, uint64_t flags,
 
     memcpy(child, parent, sizeof(struct thread));
     child->tid = 0;
+    /* CLONE_THREAD (share_vm pthread) stays in the parent's process: keep the
+     * inherited tgid.  Otherwise this is a new process: clear tgid so the
+     * scheduler assigns tgid == tid at enqueue. */
+    if (!share_vm) child->tgid = 0;
     child->state = THREAD_READY;
     child->next = NULL;
     child->all_next = NULL;

@@ -134,16 +134,22 @@ syscall_entry:
     mov rcx, [r15 + TH_TMP_RIP]
     mov r11, [r15 + TH_TMP_RFLAGS]
 
-    ; Clear segment selectors without clobbering any user GPR.  rax (the return
+    ; Clear DS/ES selectors without clobbering any user GPR.  rax (the return
     ; value) is saved on the kernel stack across the segment loads instead of in
     ; a user register (the previous code used r12 here, corrupting the user's
     ; r12 across every syscall).
+    ;
+    ; We deliberately do NOT touch FS/GS here: in long mode, loading a selector
+    ; into FS/GS zeroes that segment's hidden base, which would wipe the user's
+    ; TLS pointer (set via arch_prctl(ARCH_SET_FS)) on every syscall return and
+    ; fault the next %fs:0 access.  The kernel never loads kernel data into FS/GS
+    ; during syscall handling (per-CPU state is found via the LAPIC id, not GS),
+    ; so the user's FS/GS bases are already intact - and the scheduler reloads
+    ; FS_BASE from the thread on every context switch (sched_finish_switch).
     push rax
     xor eax, eax
     mov ds, ax
     mov es, ax
-    mov fs, ax
-    mov gs, ax
     pop rax
 
     ; Switch to the user stack, then restore the user's real r15 (until now r15

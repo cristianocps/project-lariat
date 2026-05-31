@@ -83,8 +83,43 @@
 #define SYS_CLOCK_GETTIME 228
 #define SYS_GETDENTS64    217
 
+/* Phase 0: memory protection, vectored I/O, positional I/O, and the *at family
+ * needed by ported libc (musl) and the dynamic linker. Numbers match Linux. */
+#define SYS_MPROTECT      10
+#define SYS_MUNMAP        11
+#define SYS_RT_SIGPROCMASK 14
+#define SYS_PREAD64       17
+#define SYS_PWRITE64      18
+#define SYS_READV         19
+#define SYS_WRITEV        20
+#define SYS_ACCESS        21
+#define SYS_FSYNC         74
+#define SYS_FDATASYNC     75
+#define SYS_FTRUNCATE     77
+#define SYS_RENAME        82
+#define SYS_SYMLINK       88
+#define SYS_READLINK      89
+#define SYS_CHMOD         90
+#define SYS_FCHMOD        91
+#define SYS_UMASK         95
+#define SYS_GETRLIMIT     97
+#define SYS_SETRLIMIT     160
+#define SYS_OPENAT        257
+#define SYS_NEWFSTATAT    262
+#define SYS_FACCESSAT     269
+#define SYS_DUP3          292
+#define SYS_PIPE2         293
+#define SYS_PRLIMIT64     302
+#define SYS_GETRANDOM     318
+
 /* Lariat-specific (non-Linux) syscalls live above the Linux range. */
 #define SYS_LARIAT_PS     400   /* enumerate processes for ps(1) */
+
+/* Phase M: IPC message ports (Mach-port-like). See include/uapi/lipc.h. */
+#define SYS_LARIAT_PORT_CREATE 401  /* register a named port -> id */
+#define SYS_LARIAT_PORT_OPEN   402  /* look up a named port -> id */
+#define SYS_LARIAT_PORT_SEND   403  /* send datagram to a port */
+#define SYS_LARIAT_PORT_RECV   404  /* receive datagram from a port */
 
 /* Legacy aliases kept for in-kernel call sites. */
 #define SYS_YIELD    SYS_SCHED_YIELD

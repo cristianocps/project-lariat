@@ -40,9 +40,12 @@ static unsigned to_uint(const char *s) {
 static struct passwd g_pw;
 static char g_pwline[256];
 
+/* Generous caps for the account databases (was 2 KiB). */
+#define PW_FILEBUF 16384
+
 static struct passwd *parse_match(const char *want_name, int want_uid_valid,
                                   uid_t want_uid) {
-    static char filebuf[2048];
+    static char filebuf[PW_FILEBUF];
     if (slurp("/etc/passwd", filebuf, sizeof(filebuf)) < 0) return 0;
 
     char *save = 0;
@@ -84,7 +87,7 @@ struct passwd *getpwuid(uid_t uid) {
 }
 
 int shadow_get(const char *name, char *out, size_t outsz) {
-    static char filebuf[2048];
+    static char filebuf[PW_FILEBUF];
     if (slurp("/etc/shadow", filebuf, sizeof(filebuf)) < 0) return -1;
     char *save = 0;
     for (char *line = strtok_r(filebuf, "\n", &save); line;
@@ -109,11 +112,11 @@ int shadow_get(const char *name, char *out, size_t outsz) {
 }
 
 int shadow_set(const char *name, const char *hash) {
-    static char filebuf[2048];
+    static char filebuf[PW_FILEBUF];
     int len = slurp("/etc/shadow", filebuf, sizeof(filebuf));
     if (len < 0) return -1;
 
-    static char outbuf[2048];
+    static char outbuf[PW_FILEBUF];
     size_t o = 0;
     int replaced = 0;
     char *save = 0;
@@ -149,7 +152,15 @@ int shadow_set(const char *name, const char *hash) {
 }
 
 char *crypt(const char *key, const char *setting) {
-    static char buf[64];
+    static char buf[96];
     crypt_lite(key, setting, buf, sizeof(buf));
     return buf;
+}
+
+int etc_sync(const char *name) {
+    /* No-op since adr/0013: /etc is a firmlink into the persistent /var data
+     * volume, so edits under /etc already land on disk.  Kept as a stable entry
+     * point for callers (useradd/userdel/passwd/settings). */
+    (void)name;
+    return 0;
 }

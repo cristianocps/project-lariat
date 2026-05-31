@@ -13,8 +13,20 @@ build/
 # Downloaded packages
 *.deb
 
+# Built package artifacts (see scripts/mkapps.sh)
+dist/
+*.lpkg
+
 # Local runtime dependencies (QEMU libs fetched/extracted locally)
 .local_libs/
+
+# Cross toolchain build artifacts (see toolchain/README.md)
+toolchain/install/
+toolchain/src/
+toolchain/build/
+toolchain/native/
+toolchain/packages/
+sysroot/
 
 # Debug / core files
 *.log

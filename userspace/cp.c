@@ -4,6 +4,7 @@
 #include "libc/fcntl.h"
 #include "libc/errno.h"
 #include "libc/stdio.h"
+#include "libc/sys/stat.h"
 
 static int copy(const char *src, const char *dst) {
     int in = open(src, O_RDONLY);
@@ -11,6 +12,10 @@ static int copy(const char *src, const char *dst) {
         fprintf(STDERR_FILENO, "cp: %s: error %d\n", src, errno);
         return 1;
     }
+    /* Remember the source permissions so the copy is runnable when the source
+     * was (real cp preserves the mode bits, including +x). */
+    struct stat sst;
+    int have_mode = (fstat(in, &sst) == 0);
     int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
     if (out < 0) {
         fprintf(STDERR_FILENO, "cp: %s: error %d\n", dst, errno);
@@ -28,6 +33,7 @@ static int copy(const char *src, const char *dst) {
     }
     close(in);
     close(out);
+    if (rc == 0 && have_mode) chmod(dst, sst.st_mode & 07777);
     return rc;
 }
 

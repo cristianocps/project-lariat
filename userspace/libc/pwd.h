@@ -28,4 +28,9 @@ int shadow_set(const char *name, const char *hash);
 /* crypt-lite wrapper: hash `key` using the salt embedded in `setting`. */
 char *crypt(const char *key, const char *setting);
 
+/* Mirror /etc/<name> to the persistent store /var/etc/<name> so account and
+ * group edits survive a reboot (boot-time restore reloads from /var/etc).
+ * `name` must be a bare basename with no '/'.  Returns 0 on success. */
+int etc_sync(const char *name);
+
 #endif /* LIBC_PWD_H */

@@ -25,18 +25,12 @@ device_t *block_find(const char *name);
 
 device_t *block_get_first(void);
 
-/* Read/write blocks (LBA addressing) */
-static inline int block_read(device_t *dev, uint64_t lba, void *buf, size_t count) {
-    if (dev && dev->class == DEV_CLASS_BLOCK && dev->ops.block_ops && dev->ops.block_ops->read)
-        return (int)dev->ops.block_ops->read(dev, lba, buf, count);
-    return -1;
-}
-
-static inline int block_write(device_t *dev, uint64_t lba, const void *buf, size_t count) {
-    if (dev && dev->class == DEV_CLASS_BLOCK && dev->ops.block_ops && dev->ops.block_ops->write)
-        return (int)dev->ops.block_ops->write(dev, lba, buf, count);
-    return -1;
-}
+/* Read/write blocks (LBA addressing). These go through a small write-through
+ * sector cache in block.c (see block_read/block_write there) so that repeated
+ * reads of hot metadata (FAT chains, ext4 inode/extent blocks) don't re-hit the
+ * disk, and large sequential reads are issued as few big DMA ops. */
+int block_read(device_t *dev, uint64_t lba, void *buf, size_t count);
+int block_write(device_t *dev, uint64_t lba, const void *buf, size_t count);
 
 static inline int block_flush(device_t *dev) {
     if (dev && dev->class == DEV_CLASS_BLOCK && dev->ops.block_ops && dev->ops.block_ops->flush)

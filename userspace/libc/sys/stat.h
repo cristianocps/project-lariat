@@ -5,14 +5,28 @@
 #include <stddef.h>
 #include "../unistd.h"
 
-/* Mirrors the kernel struct kstat (include/uapi.h). */
+/* Mirrors the kernel struct kstat (include/uapi/uapi.h): Linux x86_64 layout. */
 struct stat {
     uint64_t st_dev;
     uint64_t st_ino;
+    uint64_t st_nlink;
+
     uint32_t st_mode;
-    uint32_t st_nlink;
-    uint64_t st_size;
-    uint64_t st_blocks;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t __pad0;
+    uint64_t st_rdev;
+    int64_t  st_size;
+    int64_t  st_blksize;
+    int64_t  st_blocks;
+
+    int64_t  st_atime;
+    int64_t  st_atime_nsec;
+    int64_t  st_mtime;
+    int64_t  st_mtime_nsec;
+    int64_t  st_ctime;
+    int64_t  st_ctime_nsec;
+    int64_t  __unused[3];
 };
 
 /* File type bits (match include/vfs.h). */
@@ -36,6 +50,10 @@ static inline int stat(const char *path, struct stat *st) {
 
 static inline int fstat(int fd, struct stat *st) {
     return (int)__syscall_ret(syscall2(SYS_FSTAT, fd, (long)st));
+}
+
+static inline int chmod(const char *path, unsigned int mode) {
+    return (int)__syscall_ret(syscall2(SYS_CHMOD, (long)path, (long)mode));
 }
 
 #endif /* LIBC_SYS_STAT_H */

@@ -6,17 +6,33 @@
 /* --------------------------------------------------------------------------
  * Userspace/kernel shared ABI structures.
  *
- * These are intentionally simplified (not byte-for-byte Linux) since we are
- * Linux-leaning but not Linux-ABI-compatible.
+ * The syscall ABI is byte-for-byte Linux x86_64 so that binaries produced by
+ * the x86_64-linux-musl toolchain (and any other Linux-ABI userland we import)
+ * run unmodified. struct kstat below is the exact layout the stat/fstat/
+ * newfstatat syscalls must fill on Linux x86_64.
  * -------------------------------------------------------------------------- */
 
 struct kstat {
     uint64_t st_dev;
     uint64_t st_ino;
+    uint64_t st_nlink;
+
     uint32_t st_mode;
-    uint32_t st_nlink;
-    uint64_t st_size;
-    uint64_t st_blocks;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t __pad0;
+    uint64_t st_rdev;
+    int64_t  st_size;
+    int64_t  st_blksize;
+    int64_t  st_blocks;
+
+    int64_t  st_atime;
+    int64_t  st_atime_nsec;
+    int64_t  st_mtime;
+    int64_t  st_mtime_nsec;
+    int64_t  st_ctime;
+    int64_t  st_ctime_nsec;
+    int64_t  __unused[3];
 };
 
 struct dirent64 {
@@ -59,6 +75,7 @@ struct pollfd {
 #define PROT_EXEC   0x4
 #define MAP_SHARED    0x01
 #define MAP_PRIVATE   0x02
+#define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 
 /* --------------------------------------------------------------------------

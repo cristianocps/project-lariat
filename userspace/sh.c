@@ -287,11 +287,34 @@ static void run_pipeline(struct stage *stages, int nstages, int background,
 
             char path[256];
             const char *prog = s->argv[0];
-            if (!strchr(prog, '/')) {
-                snprintf(path, sizeof(path), "/bin/%s", prog);
-                prog = path;
+            if (strchr(prog, '/')) {
+                /* A path (absolute or relative) is used as-is, never searched. */
+                execve(prog, s->argv, environ);
+            } else {
+                /* Resolve a bare command name against $PATH, like any Unix
+                 * shell: try each ':'-separated directory in order (the search
+                 * order, including user-specific dirs, is set up by login).  An
+                 * unset/empty PATH falls back to the system directories. */
+                const char *penv = getenv("PATH");
+                if (!penv || !penv[0]) penv = "/usr/local/bin:/usr/bin:/bin";
+                size_t start = 0;
+                for (size_t i = 0; ; i++) {
+                    if (penv[i] == ':' || penv[i] == '\0') {
+                        size_t dl = i - start;
+                        if (dl > 0 && dl < sizeof(path) - 2) {
+                            for (size_t k = 0; k < dl; k++) path[k] = penv[start + k];
+                            path[dl] = '/';
+                            size_t p = dl + 1;
+                            for (const char *q = prog; *q && p < sizeof(path) - 1; q++)
+                                path[p++] = *q;
+                            path[p] = '\0';
+                            execve(path, s->argv, environ);
+                        }
+                        if (penv[i] == '\0') break;
+                        start = i + 1;
+                    }
+                }
             }
-            execve(prog, s->argv, environ);
             fprintf(STDERR_FILENO, "%s: command not found\n", s->argv[0]);
             _exit(127);
         }

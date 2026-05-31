@@ -143,6 +143,23 @@ struct thread {
 #define NGROUPS_MAX 16
     uint32_t          groups[NGROUPS_MAX];
     int               ngroups;
+
+    /* File-mode creation mask (umask). Inherited across fork/clone (memcpy)
+     * and preserved over exec; cleared bits in the mask are removed from the
+     * permission bits of newly created files/dirs. */
+    uint32_t          umask;
+
+    /* Thread-group id == POSIX process id.  All threads of a process (clone with
+     * CLONE_THREAD) share one tgid; getpid() returns this, gettid() returns the
+     * per-thread tid.  A fresh process has tgid == tid (set at enqueue). */
+    uint32_t          tgid;
+
+    /* Per-thread blocked signal mask managed by rt_sigprocmask (distinct from
+     * sig_mask which is also used transiently during signal delivery). */
+
+    /* User GS base set via arch_prctl(ARCH_SET_GS) (rarely used; not restored on
+     * context switch - documented limitation). */
+    uint64_t          gs_base;
 };
 
 /* --------------------------------------------------------------------------

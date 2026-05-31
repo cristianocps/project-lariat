@@ -17,6 +17,8 @@
 #include "uapi.h"
 #include "smp.h"
 #include "timer.h"
+#include "ipc.h"
+#include "procfs.h"
 #include <string.h>
 
 /* MSR addresses */
@@ -72,7 +74,10 @@ static wait_queue_t futex_buckets[FUTEX_NBUCKETS];
 
 #define FUTEX_WAIT          0
 #define FUTEX_WAKE          1
+#define FUTEX_WAIT_BITSET   9
+#define FUTEX_WAKE_BITSET   10
 #define FUTEX_PRIVATE_FLAG  128
+#define FUTEX_CLOCK_REALTIME 256
 
 static wait_queue_t *futex_bucket(uint64_t uaddr) {
     return &futex_buckets[(uaddr >> 3) % FUTEX_NBUCKETS];
@@ -86,9 +91,14 @@ static void futex_wake_addr(uint64_t uaddr, int n) {
 static uint64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
                           uint64_t timeout, uint64_t uaddr2, uint64_t val3) {
     (void)timeout; (void)uaddr2; (void)val3;
-    int cmd = (int)(op & ~FUTEX_PRIVATE_FLAG);
+    int cmd = (int)(op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME));
     int *addr = (int *)(uintptr_t)uaddr;
     if (!addr) return -EINVAL;
+
+    /* Treat the *_BITSET variants like their plain counterparts: we ignore the
+     * bitset (val3), which is a valid simplification for pthread/musl use. */
+    if (cmd == FUTEX_WAIT_BITSET) cmd = FUTEX_WAIT;
+    else if (cmd == FUTEX_WAKE_BITSET) cmd = FUTEX_WAKE;
 
     switch (cmd) {
     case FUTEX_WAIT: {
@@ -167,6 +177,16 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a3,
         if (!addr) return -EINVAL;
         *(uint64_t *)(uintptr_t)addr = t->fs_base;
         return 0;
+    case ARCH_SET_GS:
+        /* User GS base. Programmed immediately; not restored on context switch
+         * (rarely used by userland - documented in sched.h). */
+        t->gs_base = addr;
+        wrmsr(MSR_GS_BASE, addr);
+        return 0;
+    case ARCH_GET_GS:
+        if (!addr) return -EINVAL;
+        *(uint64_t *)(uintptr_t)addr = t->gs_base;
+        return 0;
     default:
         return -EINVAL;
     }
@@ -217,8 +237,15 @@ static uint64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode,
     const char *p = (const char *)(uintptr_t)path;
     int perr = vfs_access_check(p, (int)flags);
     if (perr == -EACCES) return -EACCES;
+    int existed = ((flags & O_CREAT) && vfs_lookup_path(p) != NULL);
     struct vfs_file *file = vfs_open(p, (int)flags);
     if (!file) return -ENOENT;
+    /* A newly O_CREAT'd file is owned by the creating user. */
+    if ((flags & O_CREAT) && !existed && file->inode) {
+        file->inode->uid = t->euid;
+        file->inode->gid = t->egid;
+        vfs_setattr(file->inode);
+    }
     int fd = fd_alloc(t->fdt, file);
     if (fd < 0) {
         vfs_close(file);
@@ -267,14 +294,17 @@ static uint64_t sys_getpid(uint64_t a1, uint64_t a2, uint64_t a3,
                            uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     struct thread *t = current_thread();
-    return t ? (uint64_t)t->tid : 0;
+    /* POSIX getpid() returns the process (thread-group) id, not the tid. */
+    return t ? (uint64_t)(t->tgid ? t->tgid : t->tid) : 0;
 }
 
 static uint64_t sys_getppid(uint64_t a1, uint64_t a2, uint64_t a3,
                             uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     struct thread *t = current_thread();
-    return (t && t->parent) ? (uint64_t)t->parent->tid : 0;
+    if (!t || !t->parent) return 0;
+    struct thread *p = t->parent;
+    return (uint64_t)(p->tgid ? p->tgid : p->tid);
 }
 
 static uint64_t sys_yield(uint64_t a1, uint64_t a2, uint64_t a3,
@@ -329,8 +359,11 @@ static uint64_t sys_clock_gettime(uint64_t clk, uint64_t tp, uint64_t a3,
     (void)a3; (void)a4; (void)a5; (void)a6;
     struct timespec *ts = (struct timespec *)(uintptr_t)tp;
     if (!ts) return -EFAULT;
-    uint64_t ns = (clk == CLOCK_MONOTONIC) ? clock_monotonic_ns()
-                                           : clock_realtime_ns();
+    /* Only the wall clock uses realtime; MONOTONIC and the per-process /
+     * per-thread CPU-time clocks (2,3) all map to the monotonic source so
+     * timing deltas (e.g. GCC's timevar) are always non-decreasing. */
+    uint64_t ns = (clk == CLOCK_REALTIME) ? clock_realtime_ns()
+                                          : clock_monotonic_ns();
     ts->tv_sec = (int64_t)(ns / 1000000000ull);
     ts->tv_nsec = (int64_t)(ns % 1000000000ull);
     return 0;
@@ -563,31 +596,60 @@ static uint64_t sys_brk(uint64_t addr, uint64_t a2, uint64_t a3,
 
 static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t offset) {
-    (void)addr; (void)offset;
     struct thread *t = current_thread();
     if (!t || !t->cr3) return (uint64_t)-ENOMEM;
     if (length == 0) return (uint64_t)-EINVAL;
 
     if (t->mmap_next == 0) t->mmap_next = USER_MMAP_BASE;
 
-    /* File-backed mapping (e.g. /dev/fb0): defer to the device's mmap op which
-     * maps its own physical pages into the reserved user VA range. */
+    uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t pflags = (prot & PROT_WRITE) ? PT_WRITABLE : 0;
+
+    /* MAP_FIXED honors the requested page-aligned address; otherwise we bump the
+     * per-process arena. */
+    uint64_t base;
+    if ((flags & MAP_FIXED) && addr) {
+        if (addr & (PAGE_SIZE - 1)) return (uint64_t)-EINVAL;
+        base = addr;
+    } else {
+        base = t->mmap_next;
+    }
+
+    /* File-backed mapping. */
     if (!(flags & MAP_ANONYMOUS)) {
         if (!t->fdt || (int)fd < 0 || fd >= FD_MAX) return (uint64_t)-EBADF;
         struct vfs_file *f = t->fdt->files[fd];
-        if (!f || !f->inode || !f->inode->f_ops || !f->inode->f_ops->mmap)
-            return (uint64_t)-ENODEV;
-        uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
-        uint64_t base = t->mmap_next;
-        int r = f->inode->f_ops->mmap(f, base, length, prot);
-        if (r < 0) return (uint64_t)(int64_t)r;
-        t->mmap_next = base + pages * PAGE_SIZE;
+        if (!f || !f->inode) return (uint64_t)-EBADF;
+
+        /* Device-provided mmap (e.g. /dev/fb0) maps its own physical pages. */
+        if (f->inode->f_ops && f->inode->f_ops->mmap) {
+            int r = f->inode->f_ops->mmap(f, base, length, prot);
+            if (r < 0) return (uint64_t)(int64_t)r;
+            if (base + pages * PAGE_SIZE > t->mmap_next)
+                t->mmap_next = base + pages * PAGE_SIZE;
+            return base;
+        }
+
+        /* Generic regular-file mapping: back it with anonymous pages and read
+         * the file contents at `offset` into them (private, copy-in). This is
+         * enough for the dynamic linker and programs that mmap data files. */
+        for (uint64_t i = 0; i < pages; i++) {
+            if (map_user_page(t, base + i * PAGE_SIZE, PT_WRITABLE) < 0) {
+                for (uint64_t j = 0; j < i; j++)
+                    vmm_unmap_page_in(cur_pml4(t), base + j * PAGE_SIZE);
+                return (uint64_t)-ENOMEM;
+            }
+        }
+        off_t saved = vfs_lseek(f, 0, SEEK_CUR);
+        vfs_lseek(f, (off_t)offset, SEEK_SET);
+        vfs_read(f, (void *)(uintptr_t)base, length);
+        vfs_lseek(f, saved, SEEK_SET);
+        if (base + pages * PAGE_SIZE > t->mmap_next)
+            t->mmap_next = base + pages * PAGE_SIZE;
         return base;
     }
 
-    uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint64_t base = t->mmap_next;
-    uint64_t pflags = (prot & PROT_WRITE) ? PT_WRITABLE : 0;
+    /* Anonymous mapping. */
     for (uint64_t i = 0; i < pages; i++) {
         if (map_user_page(t, base + i * PAGE_SIZE, pflags) < 0) {
             for (uint64_t j = 0; j < i; j++)
@@ -595,8 +657,42 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             return (uint64_t)-ENOMEM;
         }
     }
-    t->mmap_next = base + pages * PAGE_SIZE;
+    if (base + pages * PAGE_SIZE > t->mmap_next)
+        t->mmap_next = base + pages * PAGE_SIZE;
     return base;
+}
+
+static uint64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t a3,
+                           uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->cr3) return -EINVAL;
+    if (length == 0 || (addr & (PAGE_SIZE - 1))) return -EINVAL;
+    uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = 0; i < pages; i++)
+        vmm_unmap_page_in(cur_pml4(t), addr + i * PAGE_SIZE);
+    return 0;
+}
+
+static uint64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot,
+                             uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->cr3) return -EINVAL;
+    if (addr & (PAGE_SIZE - 1)) return -EINVAL;
+    /* Best-effort: re-map each present page in the range with the requested
+     * writability. Pages stay user/present; PROT_NONE is treated as read-only.
+     * This satisfies the dynamic linker's RELRO and JIT-style transitions. */
+    uint64_t pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t want_w = (prot & PROT_WRITE) ? PT_WRITABLE : 0;
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t v = addr + i * PAGE_SIZE;
+        uint64_t phys = vmm_virt_to_phys_in(cur_pml4(t), v);
+        if (!phys) continue;   /* unmapped page in range: ignore */
+        vmm_map_page_in(cur_pml4(t), v, phys,
+                        PT_USER | PT_PRESENT | want_w);
+    }
+    return 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -604,11 +700,13 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
  * -------------------------------------------------------------------------- */
 static void fill_stat(struct vfs_inode *inode, struct kstat *st) {
     memset(st, 0, sizeof(*st));
-    st->st_ino   = inode->inode_no;
-    st->st_mode  = inode->mode;
-    st->st_nlink = inode->nlink ? inode->nlink : 1;
-    st->st_size  = inode->size;
-    st->st_blocks = (inode->size + 511) / 512;
+    st->st_dev     = 1;
+    st->st_ino     = inode->inode_no;
+    st->st_nlink   = inode->nlink ? inode->nlink : 1;
+    st->st_mode    = inode->mode;
+    st->st_blksize = 512;
+    st->st_size    = inode->size;
+    st->st_blocks  = (inode->size + 511) / 512;
 }
 
 static uint64_t sys_stat(uint64_t path, uint64_t statbuf, uint64_t a3,
@@ -635,12 +733,378 @@ static uint64_t sys_fstat(uint64_t fd, uint64_t statbuf, uint64_t a3,
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Phase 0: additional POSIX syscalls needed by a ported libc (musl), the
+ * dynamic linker, and real coreutils.
+ * -------------------------------------------------------------------------- */
+#define AT_FDCWD        (-100)
+#define AT_EMPTY_PATH   0x1000
+#define SIG_BLOCK       0
+#define SIG_UNBLOCK     1
+#define SIG_SETMASK     2
+#define S_IFMT_MASK     0xF000u
+
+struct iovec { void *iov_base; size_t iov_len; };
+
+struct rlimit64 { uint64_t rlim_cur; uint64_t rlim_max; };
+#define RLIM_INFINITY64  (~0ULL)
+#define RLIMIT_STACK     3
+#define RLIMIT_NOFILE    7
+
+static uint64_t sys_readv(uint64_t fd, uint64_t iovp, uint64_t cnt,
+                          uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->fdt || fd >= FD_MAX || !t->fdt->files[fd]) return -EBADF;
+    const struct iovec *iov = (const struct iovec *)(uintptr_t)iovp;
+    if (!iov || (int)cnt < 0) return -EINVAL;
+    ssize_t total = 0;
+    for (int i = 0; i < (int)cnt; i++) {
+        if (iov[i].iov_len == 0) continue;
+        ssize_t n = vfs_read(t->fdt->files[fd], iov[i].iov_base, iov[i].iov_len);
+        if (n < 0) return (total > 0) ? (uint64_t)total : (uint64_t)-EIO;
+        total += n;
+        if ((size_t)n < iov[i].iov_len) break;   /* short read: stop */
+    }
+    return (uint64_t)total;
+}
+
+static uint64_t sys_writev(uint64_t fd, uint64_t iovp, uint64_t cnt,
+                           uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->fdt || fd >= FD_MAX || !t->fdt->files[fd]) return -EBADF;
+    const struct iovec *iov = (const struct iovec *)(uintptr_t)iovp;
+    if (!iov || (int)cnt < 0) return -EINVAL;
+    ssize_t total = 0;
+    for (int i = 0; i < (int)cnt; i++) {
+        if (iov[i].iov_len == 0) continue;
+        ssize_t n = vfs_write(t->fdt->files[fd], iov[i].iov_base, iov[i].iov_len);
+        if (n < 0) return (total > 0) ? (uint64_t)total : (uint64_t)-EIO;
+        total += n;
+        if ((size_t)n < iov[i].iov_len) break;
+    }
+    return (uint64_t)total;
+}
+
+static uint64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count,
+                            uint64_t offset, uint64_t a5, uint64_t a6) {
+    (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->fdt || fd >= FD_MAX || !t->fdt->files[fd]) return -EBADF;
+    struct vfs_file *f = t->fdt->files[fd];
+    off_t saved = vfs_lseek(f, 0, SEEK_CUR);
+    vfs_lseek(f, (off_t)offset, SEEK_SET);
+    ssize_t n = vfs_read(f, (void *)(uintptr_t)buf, count);
+    vfs_lseek(f, saved, SEEK_SET);
+    return (n < 0) ? (uint64_t)-EIO : (uint64_t)n;
+}
+
+static uint64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
+                             uint64_t offset, uint64_t a5, uint64_t a6) {
+    (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->fdt || fd >= FD_MAX || !t->fdt->files[fd]) return -EBADF;
+    struct vfs_file *f = t->fdt->files[fd];
+    off_t saved = vfs_lseek(f, 0, SEEK_CUR);
+    vfs_lseek(f, (off_t)offset, SEEK_SET);
+    ssize_t n = vfs_write(f, (const void *)(uintptr_t)buf, count);
+    vfs_lseek(f, saved, SEEK_SET);
+    return (n < 0) ? (uint64_t)-EIO : (uint64_t)n;
+}
+
+/* open(2) is open as openat(AT_FDCWD, ...) in modern libc; we forward AT_FDCWD
+ * and absolute paths to the regular open path. */
+static uint64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode,
+                         uint64_t a4, uint64_t a5, uint64_t a6);
+
+static uint64_t sys_openat(uint64_t dirfd, uint64_t path, uint64_t flags,
+                           uint64_t mode, uint64_t a5, uint64_t a6) {
+    const char *p = (const char *)(uintptr_t)path;
+    if (!p) return -EFAULT;
+    if (p[0] == '/' || (int)dirfd == AT_FDCWD)
+        return sys_open(path, flags, mode, a5, a6, 0);
+    return -ENOSYS;   /* dirfd-relative (non-cwd) not supported yet */
+}
+
+static uint64_t sys_stat(uint64_t path, uint64_t statbuf, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6);
+static uint64_t sys_fstat(uint64_t fd, uint64_t statbuf, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6);
+
+static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t statbuf,
+                               uint64_t flags, uint64_t a5, uint64_t a6) {
+    const char *p = (const char *)(uintptr_t)path;
+    if ((flags & AT_EMPTY_PATH) && (!p || !p[0]))
+        return sys_fstat(dirfd, statbuf, 0, a5, a6, 0);
+    if (!p) return -EFAULT;
+    if (p[0] == '/' || (int)dirfd == AT_FDCWD)
+        return sys_stat(path, statbuf, 0, a5, a6, 0);
+    return -ENOSYS;
+}
+
+static uint64_t sys_access(uint64_t path, uint64_t mode, uint64_t a3,
+                           uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)mode; (void)a3; (void)a4; (void)a5; (void)a6;
+    const char *p = (const char *)(uintptr_t)path;
+    if (!p) return -EFAULT;
+    struct vfs_dentry *d = vfs_lookup_path(p);
+    return (d && d->inode) ? 0 : -ENOENT;
+}
+
+static uint64_t sys_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode,
+                              uint64_t flags, uint64_t a5, uint64_t a6) {
+    (void)flags; (void)a5; (void)a6;
+    const char *p = (const char *)(uintptr_t)path;
+    if (!p) return -EFAULT;
+    if (p[0] == '/' || (int)dirfd == AT_FDCWD)
+        return sys_access(path, mode, 0, 0, 0, 0);
+    return -ENOSYS;
+}
+
+static uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags,
+                         uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)flags; (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->fdt) return -EBADF;
+    if (oldfd == newfd) return -EINVAL;   /* dup3 differs from dup2 here */
+    int r = fd_dup2(t->fdt, (int)oldfd, (int)newfd);
+    return (r < 0) ? (uint64_t)-EBADF : (uint64_t)r;
+}
+
+static uint64_t sys_pipe(uint64_t fds, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6);
+
+static uint64_t sys_pipe2(uint64_t fds, uint64_t flags, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)flags; (void)a3; (void)a4; (void)a5; (void)a6;
+    /* O_CLOEXEC/O_NONBLOCK accepted but not enforced. */
+    return sys_pipe(fds, 0, 0, 0, 0, 0);
+}
+
+static uint64_t sys_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t oldset,
+                                   uint64_t sigsetsize, uint64_t a5, uint64_t a6) {
+    (void)sigsetsize; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t) return -EINVAL;
+    uint64_t old = t->sig_mask;
+    if (set) {
+        uint64_t newset = *(const uint64_t *)(uintptr_t)set;
+        switch (how) {
+        case SIG_BLOCK:   t->sig_mask |= newset; break;
+        case SIG_UNBLOCK: t->sig_mask &= ~newset; break;
+        case SIG_SETMASK: t->sig_mask = newset; break;
+        default: return -EINVAL;
+        }
+        /* SIGKILL/SIGSTOP cannot be blocked. */
+        t->sig_mask &= ~((1ull << 9) | (1ull << 19));
+    }
+    if (oldset) *(uint64_t *)(uintptr_t)oldset = old;
+    return 0;
+}
+
+static uint64_t sys_getrandom(uint64_t buf, uint64_t len, uint64_t flags,
+                              uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)flags; (void)a4; (void)a5; (void)a6;
+    uint8_t *p = (uint8_t *)(uintptr_t)buf;
+    if (!p) return -EFAULT;
+    /* xorshift64 seeded from the monotonic clock and the caller's tid. Not a
+     * CSPRNG - sufficient for ASLR cookies / hash seeds in ported software. */
+    struct thread *t = current_thread();
+    uint64_t s = clock_monotonic_ns() ^ ((uint64_t)(t ? t->tid : 1) << 32);
+    if (s == 0) s = 0x9e3779b97f4a7c15ULL;
+    for (uint64_t i = 0; i < len; i++) {
+        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+        p[i] = (uint8_t)(s >> 24);
+    }
+    return (uint64_t)len;
+}
+
+static void fill_rlimit(int resource, struct rlimit64 *r) {
+    switch (resource) {
+    case RLIMIT_STACK:  r->rlim_cur = 8 * 1024 * 1024; r->rlim_max = RLIM_INFINITY64; break;
+    case RLIMIT_NOFILE: r->rlim_cur = FD_MAX; r->rlim_max = FD_MAX; break;
+    default:            r->rlim_cur = RLIM_INFINITY64; r->rlim_max = RLIM_INFINITY64; break;
+    }
+}
+
+static uint64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t newp,
+                              uint64_t oldp, uint64_t a5, uint64_t a6) {
+    (void)pid; (void)newp; (void)a5; (void)a6;   /* setting limits is a no-op */
+    if (oldp) fill_rlimit((int)resource, (struct rlimit64 *)(uintptr_t)oldp);
+    return 0;
+}
+
+static uint64_t sys_getrlimit(uint64_t resource, uint64_t rlim, uint64_t a3,
+                              uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (rlim) fill_rlimit((int)resource, (struct rlimit64 *)(uintptr_t)rlim);
+    return 0;
+}
+
+static uint64_t sys_setrlimit(uint64_t resource, uint64_t rlim, uint64_t a3,
+                              uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)resource; (void)rlim; (void)a3; (void)a4; (void)a5; (void)a6;
+    return 0;   /* accepted, not enforced */
+}
+
+static uint64_t sys_chmod(uint64_t path, uint64_t mode, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    const char *p = (const char *)(uintptr_t)path;
+    if (!p) return -EFAULT;
+    struct vfs_dentry *d = vfs_lookup_path(p);
+    if (!d || !d->inode) return -ENOENT;
+    d->inode->mode = (d->inode->mode & S_IFMT_MASK) | (uint32_t)(mode & 07777);
+    vfs_setattr(d->inode);
+    return 0;
+}
+
+static uint64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t a3,
+                           uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->fdt || fd >= FD_MAX || !t->fdt->files[fd]) return -EBADF;
+    struct vfs_inode *in = t->fdt->files[fd]->inode;
+    if (!in) return -EINVAL;
+    in->mode = (in->mode & S_IFMT_MASK) | (uint32_t)(mode & 07777);
+    vfs_setattr(in);
+    return 0;
+}
+
+static uint64_t sys_umask(uint64_t mask, uint64_t a2, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t) return 022;
+    uint32_t old = t->umask;
+    t->umask = (uint32_t)(mask & 0777);
+    return old;
+}
+
+static uint64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t a3,
+                              uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->fdt || fd >= FD_MAX || !t->fdt->files[fd]) return -EBADF;
+    struct vfs_file *f = t->fdt->files[fd];
+    if (f->inode && f->inode->f_ops && f->inode->f_ops->truncate)
+        return (uint64_t)(int64_t)f->inode->f_ops->truncate(f, (off_t)length);
+    if (f->inode) { f->inode->size = length; return 0; }   /* best effort */
+    return -EINVAL;
+}
+
+static uint64_t sys_fsync(uint64_t fd, uint64_t a2, uint64_t a3,
+                          uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    if (!t || !t->fdt || fd >= FD_MAX || !t->fdt->files[fd]) return -EBADF;
+    return 0;   /* writes are synchronous in the current FS drivers */
+}
+
+static uint64_t sys_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz,
+                             uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a4; (void)a5; (void)a6;
+    const char *p = (const char *)(uintptr_t)path;
+    char *ubuf = (char *)(uintptr_t)buf;
+    if (!p || !ubuf) return -EFAULT;
+    int n = vfs_readlink(p, ubuf, (size_t)bufsiz);
+    if (n < 0) {
+        /* Distinguish "not a symlink" from "missing" for a useful errno. */
+        struct vfs_dentry *d = vfs_lookup_path(p);
+        return (d && d->inode) ? -EINVAL : -ENOENT;
+    }
+    return (uint64_t)n;
+}
+
+static uint64_t sys_symlink(uint64_t target, uint64_t linkpath, uint64_t a3,
+                            uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    const char *t = (const char *)(uintptr_t)target;
+    const char *l = (const char *)(uintptr_t)linkpath;
+    if (!t || !l) return -EFAULT;
+    return vfs_symlink(t, l) == 0 ? 0 : -EIO;
+}
+
+/* rename(2) for regular files implemented as copy+unlink (bounded). Cross-FS
+ * and directory renames return -EXDEV/-EISDIR. */
+static uint64_t sys_rename(uint64_t oldp, uint64_t newp, uint64_t a3,
+                           uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    const char *o = (const char *)(uintptr_t)oldp;
+    const char *n = (const char *)(uintptr_t)newp;
+    if (!o || !n) return -EFAULT;
+    struct vfs_dentry *d = vfs_lookup_path(o);
+    if (!d || !d->inode) return -ENOENT;
+    if (S_ISDIR(d->inode->mode)) return -EISDIR;
+    uint64_t size = d->inode->size;
+    if (size > (1u << 20)) return -EFBIG;   /* cap copy-based rename at 1 MiB */
+
+    struct vfs_file *src = vfs_open(o, O_RDONLY);
+    if (!src) return -ENOENT;
+    struct vfs_file *dst = vfs_open(n, O_CREAT | O_WRONLY | O_TRUNC);
+    if (!dst) { vfs_close(src); return -EACCES; }
+
+    char *tmp = (char *)kmalloc(size ? size : 1);
+    if (!tmp) { vfs_close(src); vfs_close(dst); return -ENOMEM; }
+    ssize_t rd = vfs_read(src, tmp, size);
+    if (rd > 0) vfs_write(dst, tmp, (size_t)rd);
+    if (dst->inode) dst->inode->mode = d->inode->mode;
+    kfree(tmp);
+    vfs_close(src);
+    vfs_close(dst);
+    vfs_unlink(o);
+    return 0;
+}
+
 static uint64_t sys_lariat_ps(uint64_t buf, uint64_t max, uint64_t a3,
                               uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
     struct proc_info *out = (struct proc_info *)(uintptr_t)buf;
     if (!out || (int)max <= 0) return -EINVAL;
     return (uint64_t)sched_list_procs(out, (int)max);
+}
+
+/* --------------------------------------------------------------------------
+ * Phase M: IPC message ports.
+ * -------------------------------------------------------------------------- */
+static void copy_port_name(uint64_t uptr, char *out, size_t cap) {
+    const char *p = (const char *)(uintptr_t)uptr;
+    size_t i = 0;
+    if (p) for (; p[i] && i < cap - 1; i++) out[i] = p[i];
+    out[i] = '\0';
+}
+
+static uint64_t sys_port_create(uint64_t namep, uint64_t a2, uint64_t a3,
+                                uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    char name[IPC_NAME_MAX];
+    copy_port_name(namep, name, sizeof(name));
+    return (uint64_t)(int64_t)ipc_port_register(name, t ? t->tid : 0);
+}
+
+static uint64_t sys_port_open(uint64_t namep, uint64_t a2, uint64_t a3,
+                              uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    char name[IPC_NAME_MAX];
+    copy_port_name(namep, name, sizeof(name));
+    return (uint64_t)(int64_t)ipc_port_lookup(name);
+}
+
+static uint64_t sys_port_send(uint64_t id, uint64_t buf, uint64_t len,
+                              uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a4; (void)a5; (void)a6;
+    struct thread *t = current_thread();
+    return (uint64_t)ipc_port_send((int)id, (const void *)(uintptr_t)buf,
+                                   (size_t)len, t ? t->tid : 0);
+}
+
+static uint64_t sys_port_recv(uint64_t id, uint64_t buf, uint64_t max,
+                              uint64_t nonblock, uint64_t a5, uint64_t a6) {
+    (void)a5; (void)a6;
+    return (uint64_t)ipc_port_recv((int)id, (void *)(uintptr_t)buf,
+                                   (size_t)max, (int)nonblock);
 }
 
 static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
@@ -677,7 +1141,21 @@ static uint64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t a3,
     (void)a3; (void)a4; (void)a5; (void)a6;
     const char *p = (const char *)(uintptr_t)path;
     int r = vfs_mkdir(p, (uint32_t)mode);
-    return (r < 0) ? (uint64_t)-EEXIST : 0;
+    if (r == 0) {
+        /* A new directory is owned by the creating user (so an unprivileged
+         * user can populate dirs they make, e.g. ~/.local/bin). */
+        struct thread *t = current_thread();
+        struct vfs_dentry *d = vfs_lookup_path(p);
+        if (t && d && d->inode) {
+            d->inode->uid = t->euid;
+            d->inode->gid = t->egid;
+            vfs_setattr(d->inode);
+        }
+        return 0;
+    }
+    /* ramfs/ext4 return -EEXIST when the name is taken; a generic -1 means the
+     * parent path could not be resolved. */
+    return (uint64_t)(r == -EEXIST ? -EEXIST : -ENOENT);
 }
 
 static uint64_t sys_rmdir(uint64_t path, uint64_t a2, uint64_t a3,
@@ -1010,7 +1488,7 @@ static uint64_t sys_uname(uint64_t buf, uint64_t a2, uint64_t a3,
     if (!u) return -EFAULT;
     memset(u, 0, sizeof(*u));
     strcpy(u->sysname, "Lariat");
-    strcpy(u->nodename, "lariat");
+    strcpy(u->nodename, sys_hostname());
     strcpy(u->release, "0.2");
     strcpy(u->version, "Project Lariat SMP");
     strcpy(u->machine, "x86_64");
@@ -1406,6 +1884,40 @@ void syscall_init(void) {
     syscall_table[SYS_GETPGRP]      = sys_getpgrp;
     syscall_table[SYS_SETSID]       = sys_setsid;
     syscall_table[SYS_GETSID]       = sys_getsid;
+
+    /* Phase 0: VM, vectored/positional I/O, *at family, signals, limits. */
+    syscall_table[SYS_MUNMAP]       = sys_munmap;
+    syscall_table[SYS_MPROTECT]     = sys_mprotect;
+    syscall_table[SYS_READV]        = sys_readv;
+    syscall_table[SYS_WRITEV]       = sys_writev;
+    syscall_table[SYS_PREAD64]      = sys_pread64;
+    syscall_table[SYS_PWRITE64]     = sys_pwrite64;
+    syscall_table[SYS_OPENAT]       = sys_openat;
+    syscall_table[SYS_NEWFSTATAT]   = sys_newfstatat;
+    syscall_table[SYS_ACCESS]       = sys_access;
+    syscall_table[SYS_FACCESSAT]    = sys_faccessat;
+    syscall_table[SYS_DUP3]         = sys_dup3;
+    syscall_table[SYS_PIPE2]        = sys_pipe2;
+    syscall_table[SYS_RT_SIGPROCMASK] = sys_rt_sigprocmask;
+    syscall_table[SYS_GETRANDOM]    = sys_getrandom;
+    syscall_table[SYS_PRLIMIT64]    = sys_prlimit64;
+    syscall_table[SYS_GETRLIMIT]    = sys_getrlimit;
+    syscall_table[SYS_SETRLIMIT]    = sys_setrlimit;
+    syscall_table[SYS_CHMOD]        = sys_chmod;
+    syscall_table[SYS_FCHMOD]       = sys_fchmod;
+    syscall_table[SYS_UMASK]        = sys_umask;
+    syscall_table[SYS_FTRUNCATE]    = sys_ftruncate;
+    syscall_table[SYS_FSYNC]        = sys_fsync;
+    syscall_table[SYS_FDATASYNC]    = sys_fsync;
+    syscall_table[SYS_RENAME]       = sys_rename;
+    syscall_table[SYS_READLINK]     = sys_readlink;
+    syscall_table[SYS_SYMLINK]      = sys_symlink;
+
+    /* Phase M: IPC message ports. */
+    syscall_table[SYS_LARIAT_PORT_CREATE] = sys_port_create;
+    syscall_table[SYS_LARIAT_PORT_OPEN]   = sys_port_open;
+    syscall_table[SYS_LARIAT_PORT_SEND]   = sys_port_send;
+    syscall_table[SYS_LARIAT_PORT_RECV]   = sys_port_recv;
 
     /* Enable SYSCALL/SYSRET on the BSP.  The control MSRs are per-CPU, so each
      * AP repeats this from ap_main via syscall_init_cpu(). */

@@ -41,7 +41,7 @@ int main(int argc, char **argv) {
 
     /* A non-root caller must prove they know the target's password. */
     if (getuid() != 0) {
-        char pass[80], stored[80];
+        char pass[80], stored[96];
         if (read_pass("Password: ", pass, sizeof(pass)) < 0) return 1;
         if (shadow_get(target, stored, sizeof(stored)) != 0 ||
             (stored[0] != '\0' && strcmp(crypt(pass, stored), stored) != 0)) {

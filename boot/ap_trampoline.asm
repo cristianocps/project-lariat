@@ -78,6 +78,16 @@ ap_lm64:
 
     mov rsp, [P_STACK]
 
+    ; Enable SSE/SSE2 on this AP too (see boot.asm): clear CR0.EM, set CR0.MP,
+    ; set CR4.OSFXSR + CR4.OSXMMEXCPT. Userspace code uses XMM registers.
+    mov rax, cr0
+    and ax, 0xFFFB
+    or  ax, 0x2
+    mov cr0, rax
+    mov rax, cr4
+    or  ax, (1 << 9) | (1 << 10)
+    mov cr4, rax
+
     ; NOTE: we do NOT signal P_ONLINE here.  The BSP reuses this shared
     ; parameter block (including the stack pointer) for the next AP as soon as
     ; the online flag is set, so the AP must consume every shared field first.

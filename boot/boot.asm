@@ -176,6 +176,17 @@ long_mode:
     mov ss, ax
     mov rsp, 0x200000
 
+    ; Enable SSE/SSE2 (required by code the system C toolchain emits: the x86-64
+    ; baseline ABI uses XMM registers, e.g. musl's __init_tp does `movq r,xmm`).
+    ; Clear CR0.EM, set CR0.MP; set CR4.OSFXSR + CR4.OSXMMEXCPT.
+    mov rax, cr0
+    and ax, 0xFFFB          ; CR0.EM = 0 (no x87 emulation)
+    or ax, 0x2              ; CR0.MP = 1
+    mov cr0, rax
+    mov rax, cr4
+    or ax, (1 << 9) | (1 << 10)   ; CR4.OSFXSR | CR4.OSXMMEXCPT
+    mov cr4, rax
+
     ; Pass e820 info to kernel via registers:
     ; RDI = entry count (32-bit, zero-extended), RSI = buffer physical address
     mov edi, [E820_COUNT_ADDR]
@@ -246,9 +257,9 @@ DATA64_SEG equ gdt64_data - gdt32_start
 ; ---------------------------------------------------------------------------
 KERNEL_OFFSET  equ 0x7E00
 KERNEL_TARGET  equ 0x100000
-KERNEL_CHUNKS  equ 32               ; 32 chunks * 32 sectors = 1024 sectors
-KERNEL_SIZE    equ 1024 * 512       ; 512 KB load window (copied to 1 MB)
-KERNEL_SECTORS equ 1024
+KERNEL_CHUNKS  equ 56               ; 56 chunks * 32 sectors = 1792 sectors
+KERNEL_SIZE    equ 1792 * 512       ; 896 KB load window (copied to 1 MB target)
+KERNEL_SECTORS equ 1792
 
 ; Boot signature
  times 510-($-$$) db 0

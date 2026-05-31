@@ -67,7 +67,7 @@ int main(int argc, char **argv) {
                   STDOUT_FILENO);
             return 1;
         }
-        char old[80], stored[80];
+        char old[80], stored[96];
         if (read_pass("Current password: ", old, sizeof(old)) < 0) return 1;
         if (shadow_get(target, stored, sizeof(stored)) == 0 &&
             stored[0] != '\0' &&
@@ -92,6 +92,7 @@ int main(int argc, char **argv) {
         fputs("passwd: failed to update /etc/shadow\n", STDOUT_FILENO);
         return 1;
     }
+    etc_sync("shadow");   /* make the change survive a reboot */
     printf("passwd: password updated successfully\n");
     return 0;
 }

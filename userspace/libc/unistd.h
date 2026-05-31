@@ -79,7 +79,14 @@ typedef long off_t;
 #define SYS_SETGROUPS     116
 #define SYS_SETRESUID     117
 #define SYS_SETRESGID     119
+#define SYS_RENAME        82
+#define SYS_CHMOD         90
+#define SYS_FCHMOD        91
 #define SYS_LARIAT_PS     400
+#define SYS_LARIAT_PORT_CREATE 401
+#define SYS_LARIAT_PORT_OPEN   402
+#define SYS_LARIAT_PORT_SEND   403
+#define SYS_LARIAT_PORT_RECV   404
 
 /* Legacy aliases */
 #define SYS_YIELD    SYS_SCHED_YIELD

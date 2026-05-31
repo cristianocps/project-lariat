@@ -42,7 +42,7 @@ static int verify(const char *user, const char *pass, struct passwd **out) {
     if (!pw) return 0;
     *out = pw;
 
-    char stored[80];
+    char stored[96];
     if (shadow_get(user, stored, sizeof(stored)) != 0) return 0;
     if (stored[0] == '\0') return pass[0] == '\0';   /* passwordless account */
 
@@ -77,7 +77,31 @@ int main(void) {
         setenv("HOME", pw->pw_dir, 1);
         setenv("USER", pw->pw_name, 1);
         setenv("LOGNAME", pw->pw_name, 1);
-        setenv("PATH", "/bin", 1);
+
+        /* Build a Unix-style search PATH for the session (cf. Debian
+         * /etc/profile, macOS path_helper).  System-wide executables come from
+         * the *bin trees; root additionally gets the *sbin trees; an ordinary
+         * user gets their per-user ~/.local/bin and ~/bin prepended so they
+         * can install commands without touching the system image. */
+        char pathbuf[256];
+        int n = 0;
+        if (pw->pw_uid != 0) {
+            /* "<home>/.local/bin:<home>/bin:" */
+            const char *suffixes[] = { "/.local/bin:", "/bin:" };
+            for (unsigned s = 0; s < 2; s++) {
+                for (const char *h = pw->pw_dir; *h && n < (int)sizeof(pathbuf) - 1; h++)
+                    pathbuf[n++] = *h;
+                for (const char *sf = suffixes[s]; *sf && n < (int)sizeof(pathbuf) - 1; sf++)
+                    pathbuf[n++] = *sf;
+            }
+        }
+        const char *sysdirs = (pw->pw_uid == 0)
+            ? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            : "/usr/local/bin:/usr/bin:/bin";
+        for (const char *d = sysdirs; *d && n < (int)sizeof(pathbuf) - 1; d++)
+            pathbuf[n++] = *d;
+        pathbuf[n] = '\0';
+        setenv("PATH", pathbuf, 1);
         chdir(pw->pw_dir);
 
         printf("\nWelcome to Lariat, %s.\n", pw->pw_name);

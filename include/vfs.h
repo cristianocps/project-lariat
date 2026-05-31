@@ -20,6 +20,8 @@ typedef long ssize_t;
 #define S_ISDIR(m)  (((m) & S_IFDIR) == S_IFDIR)
 #define S_ISCHR(m)  (((m) & S_IFCHR) == S_IFCHR)
 #define S_ISBLK(m)  (((m) & S_IFBLK) == S_IFBLK)
+#define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
+#define S_IFMT      0xF000
 
 /* File open flags */
 #define O_RDONLY  0x0000
@@ -84,7 +86,19 @@ struct vfs_inode_ops {
     int (*unlink)(struct vfs_inode *dir, const char *name);
     int (*rmdir)(struct vfs_inode *dir, const char *name);
     int (*readdir)(struct vfs_inode *dir, int index, struct vfs_dir_entry *entry);
+    /* Create a symbolic link `name` in `dir` pointing at `target` (optional). */
+    int (*symlink)(struct vfs_inode *dir, const char *name, const char *target);
+    /* Copy this symlink's target into buf (no NUL); returns length or <0
+     * (required for any inode that can carry S_IFLNK). */
+    int (*readlink)(struct vfs_inode *inode, char *buf, size_t bufsiz);
+    /* Flush this inode's attributes (mode/uid/gid) to the backing store so a
+     * chmod/chown/creator-ownership change survives a re-read or remount.
+     * In-memory filesystems (ramfs) may treat this as a no-op.  Optional. */
+    int (*setattr)(struct vfs_inode *inode);
 };
+
+/* Persist an inode's mode/uid/gid via its filesystem (no-op if unsupported). */
+int vfs_setattr(struct vfs_inode *inode);
 
 /* Inode - represents a file or directory on a filesystem */
 struct vfs_inode {
@@ -169,15 +183,36 @@ void vfs_init(void);
 int vfs_register_fs(struct vfs_fs_type *fs);
 int vfs_mount(const char *fs_name, const char *dev_name, const char *path);
 
+/* Mount table (for /proc/mounts and fstab idempotency). */
+#define VFS_MAX_MOUNTS 16
+struct vfs_mount_rec {
+    char dev[32];      /* backing device, or "none" for synthetic fs */
+    char path[64];     /* mount point */
+    char fstype[16];   /* filesystem type name */
+};
+int vfs_mounts_count(void);
+const struct vfs_mount_rec *vfs_mounts_get(int i);
+int vfs_is_mounted(const char *path);
+
 struct vfs_file *vfs_open(const char *path, int flags);
 int vfs_close(struct vfs_file *file);
 ssize_t vfs_read(struct vfs_file *file, void *buf, size_t count);
 ssize_t vfs_write(struct vfs_file *file, const void *buf, size_t count);
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#endif
 off_t vfs_lseek(struct vfs_file *file, off_t offset, int whence);
 
 int vfs_mkdir(const char *path, uint32_t mode);
 int vfs_unlink(const char *path);
 int vfs_rmdir(const char *path);
+
+/* Create a symlink at `linkpath` pointing at `target`. Returns 0 or <0. */
+int vfs_symlink(const char *target, const char *linkpath);
+/* Read a symlink's target WITHOUT following it; returns length or <0. */
+int vfs_readlink(const char *path, char *buf, size_t bufsiz);
 
 /* Directory handle */
 struct vfs_dir {

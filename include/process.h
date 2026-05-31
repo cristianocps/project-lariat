@@ -6,8 +6,13 @@
 
 /* Userspace memory layout */
 #define USER_CODE_START   0x0000000040000000ULL   /* 1 GB - above kernel identity map */
+#define USER_DYN_BASE     0x0000000040000000ULL   /* load bias for PIE (ET_DYN linked at 0) */
 #define USER_STACK_TOP    0x0000007FC0000000ULL   /* high user address */
-#define USER_STACK_SIZE   (4 * 4096)              /* 16 KB user stack */
+/* 1 MiB committed user stack (was 16 KiB).  Real programs and a ported libc
+ * need far more than 16 KiB; the page immediately below the stack is left
+ * unmapped and acts as a guard page (a stack overflow faults instead of
+ * silently corrupting the heap/mmap arena). */
+#define USER_STACK_SIZE   (256 * 4096)            /* 1 MiB user stack */
 
 struct thread;
 

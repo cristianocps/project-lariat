@@ -77,12 +77,24 @@ static int ata_wait_drq(ata_dev_t *dev) {
  * Soft reset the bus
  * -------------------------------------------------------------------------- */
 static void ata_soft_reset(uint16_t ctrl) {
+    /* Assert SRST for well over the 5us minimum, then deassert and let the
+     * channel settle.  QEMU's secondary channel in particular needs a real
+     * settle window or its master comes up reporting an all-zero status. */
     outb(ctrl, 0x04);  /* SRST */
-    io_wait();
-    io_wait();
+    for (volatile int i = 0; i < 100; i++) io_wait();
     outb(ctrl, 0x00);
-    io_wait();
-    io_wait();
+    for (volatile int i = 0; i < 100; i++) io_wait();
+    /* After deasserting SRST the channel keeps BSY high until the drive(s) have
+     * re-initialised.  The control/alt-status port is at ctrl; poll it (rather
+     * than the command-block status, to avoid clearing a pending IRQ) until BSY
+     * drops, with a generous timeout so a slow secondary channel comes up before
+     * we start IDENTIFY probing.  Reading 0xFF means the channel is empty. */
+    int timeout = 5000000;
+    while (--timeout > 0) {
+        uint8_t st = inb(ctrl);
+        if (st == 0xFF) break;
+        if (!(st & ATA_STAT_BSY)) break;
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -143,39 +155,69 @@ static int ata_issue_cmd_lba48(ata_dev_t *dev, uint8_t cmd,
  * Identify device
  * -------------------------------------------------------------------------- */
 static int ata_identify(ata_dev_t *dev) {
-    /* Select drive and issue identify */
-    ata_write_reg(dev, ATA_REG_DRIVE, dev->drive | ATA_DRIVE_LBA);
-    for (volatile int i = 0; i < 15; i++) {
-        inb(dev->ctrl);
-    }
-
-    ata_write_reg(dev, ATA_REG_SECCOUNT, 0);
-    ata_write_reg(dev, ATA_REG_LBA_LO, 0);
-    ata_write_reg(dev, ATA_REG_LBA_MID, 0);
-    ata_write_reg(dev, ATA_REG_LBA_HIGH, 0);
-    ata_write_reg(dev, ATA_REG_COMMAND, ATA_CMD_IDENTIFY);
-
-    /* Wait for BSY to clear */
-    uint8_t status;
-    int timeout = 10000;
-    while (timeout-- > 0) {
-        status = ata_read_reg(dev, ATA_REG_STATUS);
-        if (status != 0) break;
-    }
-    if (status == 0) return -1;  /* No device */
-
-    /* Check for ATAPI / SATA */
-    uint8_t mid = ata_read_reg(dev, ATA_REG_LBA_MID);
-    uint8_t high = ata_read_reg(dev, ATA_REG_LBA_HIGH);
-    if (mid != 0 || high != 0) return -1;  /* Not ATA */
-
-    /* Wait for command to complete */
-    if (ata_wait_bsy(dev) < 0) return -1;
-    if (!(ata_read_reg(dev, ATA_REG_STATUS) & ATA_STAT_DRQ)) return -1;
-
-    /* Read identify data */
     uint16_t id_buf[256];
-    ata_read_data(dev, id_buf, 256);
+    uint8_t status = 0;
+    int got = 0;
+
+    /* QEMU's secondary IDE channel is sometimes not fully ready the first time
+     * we probe it right after a soft reset (the master reports an all-zero
+     * status and ignores IDENTIFY).  Retry a few times, re-resetting the channel
+     * between attempts, so a present-but-slow drive is reliably detected while a
+     * genuinely absent one still fails. */
+    for (int attempt = 0; attempt < 4 && !got; attempt++) {
+        if (attempt > 0)
+            ata_soft_reset(dev->ctrl);
+
+        /* Select drive, then give it the mandated 400ns settle by reading the
+         * alternate-status register a few times. */
+        ata_write_reg(dev, ATA_REG_DRIVE, dev->drive | ATA_DRIVE_LBA);
+        for (volatile int i = 0; i < 15; i++)
+            inb(dev->ctrl);
+
+        /* Floating bus: an empty channel reads 0xFF.  Definitively no device. */
+        if (ata_read_reg(dev, ATA_REG_STATUS) == 0xFF)
+            return -1;
+
+        ata_write_reg(dev, ATA_REG_SECCOUNT, 0);
+        ata_write_reg(dev, ATA_REG_LBA_LO, 0);
+        ata_write_reg(dev, ATA_REG_LBA_MID, 0);
+        ata_write_reg(dev, ATA_REG_LBA_HIGH, 0);
+        ata_write_reg(dev, ATA_REG_COMMAND, ATA_CMD_IDENTIFY);
+
+        /* Wait for the drive to respond by asserting a non-zero status. */
+        int wait = 5000000;
+        while (--wait > 0) {
+            status = ata_read_reg(dev, ATA_REG_STATUS);
+            if (status != 0) break;
+        }
+        if (status == 0) continue;   /* unresponsive this round; retry */
+
+        /* Wait for BSY to clear (the signature registers are valid only then). */
+        int timeout = 5000000;
+        while ((ata_read_reg(dev, ATA_REG_STATUS) & ATA_STAT_BSY) && --timeout > 0)
+            ;
+        if (timeout <= 0) continue;
+
+        /* Non-zero mid/high signature => ATAPI/SATA, not a plain ATA disk. */
+        uint8_t mid = ata_read_reg(dev, ATA_REG_LBA_MID);
+        uint8_t high = ata_read_reg(dev, ATA_REG_LBA_HIGH);
+        if (mid != 0 || high != 0) return -1;
+
+        /* Wait for DRQ (data ready) or ERR. */
+        timeout = 5000000;
+        int ok = 0;
+        for (;;) {
+            status = ata_read_reg(dev, ATA_REG_STATUS);
+            if (status & ATA_STAT_ERR) break;
+            if (status & ATA_STAT_DRQ) { ok = 1; break; }
+            if (--timeout <= 0) break;
+        }
+        if (!ok) continue;
+
+        ata_read_data(dev, id_buf, 256);
+        got = 1;
+    }
+    if (!got) return -1;
 
     /* Extract info */
     dev->sectors = ((uint64_t)id_buf[61] << 16) | id_buf[60];
@@ -353,14 +395,38 @@ int ata_flush(ata_dev_t *dev) {
 /* --------------------------------------------------------------------------
  * Block device ops wrapper (uses DMA)
  * -------------------------------------------------------------------------- */
+/* A single bus-master PRD entry's byte_count is 16-bit, so one DMA transfer
+ * tops out at 64 KiB. Cap each DMA op at 64 sectors (32 KiB) - comfortably
+ * within that and the driver's 256-sector ceiling - and split larger block
+ * requests into a loop so callers can issue arbitrarily large transfers. */
+#define ATA_DMA_CHUNK_SECTORS 64
+
 static ssize_t ata_block_read(device_t *dev, uint64_t lba, void *buf, size_t count) {
     ata_dev_t *ata = (ata_dev_t *)dev->priv;
-    return ata_read_sectors_dma(ata, lba, buf, count) == 0 ? (ssize_t)(count * 512) : -1;
+    uint8_t *p = (uint8_t *)buf;
+    size_t done = 0;
+    while (done < count) {
+        size_t n = count - done;
+        if (n > ATA_DMA_CHUNK_SECTORS) n = ATA_DMA_CHUNK_SECTORS;
+        if (ata_read_sectors_dma(ata, lba + done, p + done * 512, n) != 0)
+            return done ? (ssize_t)(done * 512) : -1;
+        done += n;
+    }
+    return (ssize_t)(count * 512);
 }
 
 static ssize_t ata_block_write(device_t *dev, uint64_t lba, const void *buf, size_t count) {
     ata_dev_t *ata = (ata_dev_t *)dev->priv;
-    return ata_write_sectors_dma(ata, lba, buf, count) == 0 ? (ssize_t)(count * 512) : -1;
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t done = 0;
+    while (done < count) {
+        size_t n = count - done;
+        if (n > ATA_DMA_CHUNK_SECTORS) n = ATA_DMA_CHUNK_SECTORS;
+        if (ata_write_sectors_dma(ata, lba + done, p + done * 512, n) != 0)
+            return done ? (ssize_t)(done * 512) : -1;
+        done += n;
+    }
+    return (ssize_t)(count * 512);
 }
 
 static int ata_block_flush(device_t *dev) {

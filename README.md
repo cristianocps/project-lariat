@@ -4,6 +4,11 @@ A 64-bit operating system built from scratch for the x86_64 architecture, with a
 preemptive scheduler, a Linux-leaning POSIX syscall surface, and symmetric
 multiprocessing (SMP) bring-up.
 
+> Documentation lives in [`docs/`](docs/): see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+> for the subsystem overview, [`docs/LAYOUT.md`](docs/LAYOUT.md) for the repo
+> layout and conventions, and [`docs/adr/`](docs/adr/) for the Architecture
+> Decision Records behind the evolution roadmap.
+
 ## Architecture
 
 - **Bootloader**: Custom 16-bit real-mode boot sector written in NASM assembly
@@ -33,9 +38,13 @@ multiprocessing (SMP) bring-up.
   schedule ring-3 threads** (a thread can migrate between cores). A
   lock-protected cross-core work queue also runs kernel jobs in parallel
 - **Userspace**: Ring-3 processes via SYSCALL/SYSRET, an ELF64 loader, and a
-  Linux x86_64-numbered syscall ABI with negative-`errno` returns. Ships an
-  interactive **shell** (`/bin/sh`) plus small `/bin` programs (`ls`, `cat`,
-  `echo`, `hello`) and a minimal **libc** (crt0, string, stdlib/malloc, stdio/printf)
+  Linux x86_64-numbered syscall ABI with negative-`errno` returns. PID 1 `init`
+  runs self-tests then a **login loop** (`/bin/login` authenticates against
+  `/etc/passwd`+`/etc/shadow` and drops privileges before exec'ing the user
+  shell). Ships an interactive **shell** (`/bin/sh`, with pipelines `|`,
+  redirection `>`/`>>`/`<`, `;` sequencing, background `&`, and job control)
+  plus coreutils-style `/bin` programs, networking demos, and a framebuffer
+  desktop compositor (`gui`), backed by a minimal in-tree **libc**
 - **Filesystems**: VFS layer with ramfs, FAT32, and ext4 support
 - **Drivers**: ATA/IDE block driver (with >4 GB DMA bounce buffers), PCI bus scan,
   PS/2 keyboard and **interrupt-driven COM1 serial input**, both routed through
@@ -55,10 +64,13 @@ project-lariat/
 │   ├── timer.c                  # Tick counter + LAPIC-driven scheduler tick
 │   ├── syscall.c / syscall_asm.asm  # SYSCALL/SYSRET setup and handlers
 │   └── context.asm              # switch_thread() assembly context switch
-├── drivers/
-│   ├── ata.c                    # ATA/IDE block device driver
-│   ├── keyboard.c               # PS/2 keyboard + COM1 RX IRQ → shared TTY ring buffer
-│   └── serial.c                 # COM1 serial output + RX interrupt enable
+├── drivers/                     # Drivers grouped by class (see docs/LAYOUT.md)
+│   ├── block/ata.c              # ATA/IDE block device driver
+│   ├── char/serial.c            # COM1 serial output + RX interrupt enable
+│   ├── input/keyboard.c         # PS/2 keyboard + COM1 RX IRQ → shared TTY ring buffer
+│   ├── input/mouse.c            # PS/2 mouse → /dev/input
+│   ├── net/rtl8139.c            # RTL8139 NIC driver
+│   └── video/bochs_vbe.c        # Bochs/QEMU VBE framebuffer → /dev/fb0
 ├── kernel/
 │   ├── entry.asm                # 64-bit kernel entry: BSS zeroing, stack setup
 │   ├── kernel.c                 # Kernel main (kmain)
@@ -87,7 +99,9 @@ project-lariat/
 │       ├── fat32.c              # FAT32 filesystem driver
 │       └── ext4.c               # ext4 filesystem driver (read-only, basic)
 ├── include/
-│   └── *.h                      # Kernel headers
+│   ├── *.h                      # Kernel-internal headers
+│   └── uapi/                    # Public ABI headers (syscall.h, uapi.h) shared with userspace
+├── docs/                        # ARCHITECTURE.md, LAYOUT.md, adr/ decision records
 ├── userspace/
 │   ├── init.c / init.S          # PID 1: runs POSIX self-tests, then execs /bin/sh
 │   ├── sh.c                     # Interactive shell (built-ins + fork/execve of /bin)
@@ -223,8 +237,8 @@ the topology via ACPI and brings every core online.
   console *before* the shell is ready can overrun the UART (the kernel isn't
   servicing IRQ4 yet). Interactive typing and post-boot input are reliable;
   scripted tests should send input after the prompt appears.
-- **No pipelines/redirection in the shell yet** (`|`, `>`, `<`); the shell runs
-  one foreground command at a time. `malloc`/`free` is a bump allocator.
+- The userspace `malloc`/`free` is a bump allocator (a real free-list/`mmap`
+  allocator is planned in the evolution roadmap).
 - Stubs remain in `module.c` (symbol tables) and the PCI `request_irq` path is
   unused (the generic IRQ API still routes through the now-disabled PIC).
 

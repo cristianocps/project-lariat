@@ -363,6 +363,7 @@ struct thread *thread_create(void (*entry)(void *), void *arg) {
     }
 
     t->tid = next_tid++;
+    if (t->tgid == 0) t->tgid = t->tid;
     t->state = THREAD_READY;
     t->entry = entry;
     t->arg = arg;
@@ -645,6 +646,10 @@ void scheduler_init(void) {
 void sched_enqueue_thread_tid(struct thread *t, int *settid_a, int *settid_b) {
     uint64_t flags = spin_lock_irqsave(&sched_lock);
     t->tid = next_tid++;
+    /* A thread that does not inherit a thread group (tgid==0) leads its own
+     * process: tgid == tid.  CLONE_THREAD children pre-set tgid to the parent's
+     * before enqueue, so this keeps them in the same process. */
+    if (t->tgid == 0) t->tgid = t->tid;
     t->state = THREAD_READY;
     /* A freshly-created user process with no inherited group leads its own
      * process group and session (fork inherits the parent's via memcpy). */
