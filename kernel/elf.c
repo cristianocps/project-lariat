@@ -633,6 +633,11 @@ int elf_execve(struct thread *t, const char *path,
     t->sig_mask = 0;
     t->sig_restorer = 0;
 
+    /* Linux clears the CLONE_CHILD_CLEARTID pointer across execve: the old
+     * value refers to the previous image's address space and would otherwise be
+     * a stale/dangling pointer the kernel tries to zero at exit. */
+    t->clear_child_tid = 0;
+
     struct auxval aux[16];
     int naux = 0;
 

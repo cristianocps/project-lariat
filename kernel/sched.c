@@ -409,6 +409,20 @@ struct thread *thread_create(void (*entry)(void *), void *arg) {
  * Thread exit
  * -------------------------------------------------------------------------- */
 void thread_exit(void) {
+    /* POSIX: a process's file descriptors are released when it *exits*, not when
+     * its parent reaps the zombie.  Closing them here (before we go zombie) is
+     * essential: e.g. dash's command substitution reads a pipe until EOF and
+     * only then waits - so the write end, held by the exiting child, must close
+     * now or the reader (and hence the reaper) would deadlock forever.  Done
+     * before taking sched_lock since vfs_close may touch other subsystems. */
+    {
+        struct thread *me = current_thread();
+        if (me && me->fdt) {
+            fd_table_free(me->fdt);
+            me->fdt = NULL;
+        }
+    }
+
     uint64_t flags = spin_lock_irqsave(&sched_lock);
     struct percpu *pc = smp_this_percpu();
     struct thread *cur = pc->current;

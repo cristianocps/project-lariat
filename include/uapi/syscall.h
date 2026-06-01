@@ -62,6 +62,7 @@
 #define SYS_SETSOCKOPT    54
 #define SYS_GETSOCKOPT    55
 #define SYS_FORK          57
+#define SYS_VFORK         58
 #define SYS_EXECVE        59
 #define SYS_EXIT          60
 #define SYS_WAIT4         61

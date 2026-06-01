@@ -148,9 +148,13 @@ static uint64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
  * zero the futex word in the (still-mapped) address space and wake waiters. */
 static void clear_child_tid_on_exit(struct thread *t) {
     if (t && t->clear_child_tid) {
-        int *p = (int *)(uintptr_t)t->clear_child_tid;
-        *p = 0;
-        futex_wake_addr(t->clear_child_tid, 0x7fffffff);
+        uint64_t uaddr = t->clear_child_tid;
+        /* The pointer originates in userspace (set_tid_address / clone) and may
+         * be stale or bogus - it must never be allowed to fault the kernel. Only
+         * write when the page is actually mapped in this address space. */
+        if (vmm_virt_to_phys_in(cur_pml4(t), uaddr))
+            *(int *)(uintptr_t)uaddr = 0;
+        futex_wake_addr(uaddr, 0x7fffffff);
         t->clear_child_tid = 0;
     }
 }
@@ -1871,6 +1875,10 @@ void syscall_init(void) {
     syscall_table[SYS_NANOSLEEP]    = sys_nanosleep;
     syscall_table[SYS_GETPID]       = sys_getpid;
     syscall_table[SYS_FORK]         = sys_fork;
+    /* vfork is implemented as a full fork: the child runs in its own copied
+     * address space (not the parent's), which is safe for its only use here -
+     * dup2/close/exec - and avoids the parent-suspension complexity. */
+    syscall_table[SYS_VFORK]        = sys_fork;
     syscall_table[SYS_EXECVE]       = sys_execve;
     syscall_table[SYS_EXIT]         = sys_exit;
     syscall_table[SYS_EXIT_GROUP]   = sys_exit;

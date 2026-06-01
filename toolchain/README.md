@@ -63,6 +63,21 @@ echo 'int main(){return 0;}' > /tmp/t.c && gcc -o /tmp/t /tmp/t.c && /tmp/t
 always-present on-device compiler used to prove the compile-and-run path in the
 `init` self-tests before the full GCC packages are installed.
 
+### Application packages (build infrastructure)
+
+Cross-built C programs that round out the on-device build environment. Each is a
+dynamic PIE depending on `libc-dev`; see `docs/adr/0017` (make) and `0018`
+(dash).
+
+```sh
+./build-make.sh                   # make-*.lpkg     (GNU make)
+./build-dash.sh                   # dash-*.lpkg     (POSIX /bin/sh for configure)
+./build-m4.sh                     # m4-*.lpkg       (macro processor; autoconf dep)
+```
+
+On device, `lpkg install` them as above; dash installs as both `/usr/bin/dash`
+and `/usr/bin/sh`.
+
 ## Outputs (all gitignored)
 
 - `toolchain/install/` - the cross compiler

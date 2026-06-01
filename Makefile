@@ -3,7 +3,10 @@ NASM    = nasm
 CC      = gcc
 LD      = ld
 OBJCOPY = objcopy
-QEMU    = LD_LIBRARY_PATH=/tmp/qemu-extract/usr/lib/x86_64-linux-gnu QEMU_MODULE_DIR=/tmp/qemu-extract/usr/lib/x86_64-linux-gnu/qemu $(HOME)/.local/bin/qemu-system-x86_64
+# Portable QEMU runtime lives in-repo (persists across reboots, unlike /tmp).
+# Override QEMU_RT to point elsewhere if needed.
+QEMU_RT = $(CURDIR)/.local_libs/extract
+QEMU    = LD_LIBRARY_PATH=$(QEMU_RT)/usr/lib/x86_64-linux-gnu QEMU_MODULE_DIR=$(QEMU_RT)/usr/lib/x86_64-linux-gnu/qemu $(HOME)/.local/bin/qemu-system-x86_64
 
 CFLAGS  = -m64 -ffreestanding -Os -Wall -Wextra -nostdlib -nostartfiles \
           -fno-builtin -fno-exceptions -fno-stack-protector -nodefaultlibs \
@@ -12,7 +15,7 @@ CFLAGS  = -m64 -ffreestanding -Os -Wall -Wextra -nostdlib -nostartfiles \
           -Iinclude -Iinclude/uapi \
           -MMD -MP
 
-QEMU_FLAGS = -L /tmp/qemu-extract/usr/share/qemu -L /tmp/qemu-extract/usr/share/seabios
+QEMU_FLAGS = -L $(QEMU_RT)/usr/share/qemu -L $(QEMU_RT)/usr/share/seabios
 
 BOOT_SRC   = boot/boot.asm
 LINKER     = linker.ld

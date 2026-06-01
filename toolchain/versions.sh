@@ -18,6 +18,8 @@ export BINUTILS_VER="${BINUTILS_VER:-2.42}"
 export GCC_VER="${GCC_VER:-14.1.0}"
 export MUSL_VER="${MUSL_VER:-1.2.5}"
 export MAKE_VER="${MAKE_VER:-4.4.1}"
+export DASH_VER="${DASH_VER:-0.5.12}"
+export M4_VER="${M4_VER:-1.4.19}"
 
 # Where everything lives. Build artifacts; all gitignored.
 export TC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
