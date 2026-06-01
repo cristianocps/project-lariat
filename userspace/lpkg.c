@@ -333,9 +333,9 @@ static int cmd_install(const char *archive, int force) {
         close(fd);
     }
 
-    /* Cache the archive so `lpkg sync` can re-extract after a reboot. */
-    snprintf(path, sizeof(path), "%s/archive", dir);
-    install_file(path, p.data, p.len, 0644);
+    /* Installed files land under /usr, which is firmlinked onto the persistent
+     * /var data volume, so they survive reboot in place - there is no need to
+     * cache the archive in the DB for a boot-time re-extract anymore. */
 
     printf("installed %s %s (%d file%s)\n", p.name, p.version, p.nfiles,
            p.nfiles == 1 ? "" : "s");
@@ -446,10 +446,14 @@ static int cmd_info(const char *name) {
     return 0;
 }
 
-/* Re-extract every recorded package from its cached archive (post-reboot). */
+/* Historically `lpkg sync` re-extracted every recorded package into the
+ * volatile ramfs tree after a reboot.  Now that /usr is firmlinked onto the
+ * persistent /var volume, installed files survive reboot in place and no sync
+ * is needed.  The command is kept as a no-op so existing scripts/habits do not
+ * break, and reports the package count for reassurance. */
 static int cmd_sync(void) {
     int fd = open(DB_DIR, O_RDONLY);
-    if (fd < 0) return 0;
+    if (fd < 0) { printf("lpkg: nothing to sync (no package database)\n"); return 0; }
     char buf[2048];
     long n;
     int count = 0;
@@ -457,22 +461,13 @@ static int cmd_sync(void) {
         long off = 0;
         while (off < n) {
             struct dirent64 *d = (struct dirent64 *)(buf + off);
-            if (d->d_name[0] != '.' && db_pkg_installed(d->d_name)) {
-                char apath[256];
-                snprintf(apath, sizeof(apath), "%s/%s/archive", DB_DIR, d->d_name);
-                unsigned long len = 0;
-                char *data = read_whole(apath, &len);
-                if (data) {
-                    struct pkg p;
-                    if (pkg_parse(&p, data, len) == 0 && extract_files(&p) == 0) count++;
-                    free(data);
-                }
-            }
+            if (d->d_name[0] != '.' && db_pkg_installed(d->d_name)) count++;
             off += d->d_reclen;
         }
     }
     close(fd);
-    printf("lpkg: synced %d package%s\n", count, count == 1 ? "" : "s");
+    printf("lpkg: %d package%s installed on persistent /usr (no sync needed)\n",
+           count, count == 1 ? "" : "s");
     return 0;
 }
 

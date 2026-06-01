@@ -65,10 +65,12 @@ framebuffer + rtl8139 drivers.
   chunks; write-through sector cache that coalesces cold-miss runs.
 - Reliable IDE secondary-channel detection (`-device ide-hd,bus=ide.1`,
   `cache=writethrough`, longer ATA soft-reset/settle).
-- **Writable ext4** in-kernel: extents, block/inode bitmap alloc+free, dir entry
-  insert/remove (idempotent `create`/`mkdir`), inode writeback, truncate,
+- **Writable ext4** in-kernel: a full **extent tree** (inline depth-0 list that
+  grows into on-disk index/leaf blocks, contiguous-run allocation, sorted insert
+  for back-seek writes), block/inode bitmap alloc+free, dir entry insert/remove
+  (idempotent `create`/`mkdir`), inode writeback, tree-aware truncate, and
   deleted-inode stamping. `e2fsck -fn` clean across create/write/mkdir/unlink/
-  rmdir cycles and across reboots.
+  rmdir cycles, large/fragmented files, and across reboots.
 - **Persistence migrated off FAT32 onto ext4**: system state (`/etc`), the
   package database (`/var/lib/lpkg`), and package delivery now live on the ext4
   volume. Validated by a two-boot seed→restore cycle, fsck-clean.
@@ -105,9 +107,12 @@ to mount, the boot enters a **ramfs-only rescue mode** (factory defaults, no
 persistence) instead of failing. Verified: `/proc/mounts` lists all volumes,
 fstab brings up FAT32, and a zeroed `/var` device boots to login in rescue mode.
 
-### N4 — Package persistence completeness 🧊
-Run `lpkg sync` at boot so installed package payloads are re-extracted from the
-persistent DB into the (volatile) system tree after a reboot.
+### N4 — Package persistence completeness ✅ (superseded)
+Originally: run `lpkg sync` at boot to re-extract installed payloads from the
+persistent DB into the volatile system tree. **Retired** in favor of a
+persistent `/usr`: `/usr` is now a firmlink onto `/var/usr`, so `lpkg install`
+writes payloads to disk once and they survive reboot with no re-extraction.
+`lpkg sync` is now a no-op and the boot-time re-extract is gone. See `adr/0019`.
 
 ### N7 — Existing-application compatibility: Python 🚧
 Prove and grow the ability to run real third-party interpreters. Staged:
@@ -166,8 +171,10 @@ phase is the hard prerequisite for bash and every interactive tool.
 - **6d — Dynamic loader maturity:** `dlopen`/`dlsym`, multi-`.so` dependency
   graphs, `RUNPATH`/search, an `ldconfig`-equivalent cache.
 - **6e — Runtime plumbing:** `/tmp`, env + minimal `C.UTF-8` locale,
-  larger/demand-paged `execve`, ext4 multi-level extents for large/fragmented
-  writes, and `lpkg sync` at boot (folds in N4).
+  larger/demand-paged `execve`, **ext4 multi-level extent-tree writes** for
+  large/fragmented files ✅ (gcc's 43 MB `cc1` writes correctly; sorted insert
+  keeps linker back-seek output `e2fsck`-clean), and a **persistent `/usr`
+  firmlink** that retires `lpkg sync` at boot (subsumes N4). See `adr/0019`.
 
 ### Phase 7 — Self-hosted toolchain & build infrastructure 🚧
 Make the system able to build software *on itself*.
@@ -209,6 +216,12 @@ Make the system able to build software *on itself*.
   *Known limitations (tracked for later phases):* **`-static`** produces a
   low-address `ET_EXEC` that collides with kernel memory (dynamic PIE is the
   working path); and `g++` (`libstdc++`) is deferred.
+- **Persistent install prefix** ✅ (`adr/0019`). `/usr` is now a firmlink onto
+  `/var/usr` (and the musl loader lives at `/var/usr/lib`), so the whole
+  toolchain — `libc-dev`, `binutils`, `gcc`, `make`, `dash`, `m4` — installs
+  **once** to disk and survives reboot with **no `lpkg sync`** and a fast boot.
+  This depended on the ext4 extent-tree write fix (6e): gcc's 43 MB `cc1` and
+  the linker's back-seek output now write `e2fsck`-clean.
 - **7b — rebuild gcc itself on device** 🚧 (the full `adr/0012` loop). The
   compiler now builds and links arbitrary C programs on device, and **GNU `make`
   drives multi-step `gcc` builds** (see below); the remaining work is the

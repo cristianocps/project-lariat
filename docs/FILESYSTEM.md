@@ -14,12 +14,14 @@ DOS/Windows "drive letters."
 The model is **macOS-style**: an *immutable system image* plus a *persistent
 data volume*.
 
-- The system tree (`/`, `/bin`, `/usr`, …) is **ramfs**, rebuilt from the kernel
-  image on every boot — always consistent, never corrupted by a crash.
+- The system root (`/`, `/bin`) is **ramfs**, rebuilt from the kernel image on
+  every boot — always consistent, never corrupted by a crash. `/bin` is the
+  immutable bootstrap command set (materialized from the kernel each boot).
 - All persistent state lives on one **ext4 data volume** mounted at `/var`.
-- `/etc` and `/home` are **firmlinks** (symlinks) into `/var`, so configuration
-  and user data persist in place while still appearing at their conventional
-  Unix paths.
+- `/etc`, `/home`, and the package install prefix **`/usr`** are **firmlinks**
+  (symlinks) into `/var`, so configuration, user data, and installed
+  apps/libraries persist in place while still appearing at their conventional
+  Unix paths. Installed packages survive reboot with **no re-extraction**.
 
 ## 2. Namespace & mount layout
 
@@ -27,14 +29,17 @@ data volume*.
 /                ramfs    immutable system root, rebuilt from the kernel each boot
 ├── bin/         ramfs    coreutils + system binaries — real files materialized
 │                         from the kernel image at boot (ls/cp/stat see them)
+├── lib/         ramfs    holds the loader firmlink ld-musl-x86_64.so.1 ► /var/usr/lib
 ├── etc   ─────► /var/etc     (firmlink)  persistent system configuration
 ├── home  ─────► /var/home    (firmlink)  persistent user home directories
+├── usr   ─────► /var/usr     (firmlink)  persistent package install prefix
 ├── dev/         devfs    /dev/console, /dev/fb0, /dev/input, …
 ├── proc/        procfs   process + config + service introspection
 ├── var/         ext4     THE persistent data volume (read-write)
 │   ├── etc/              passwd, shadow, group, hostname, lariat.conf, fstab, profile
 │   ├── home/             root/, user/, <accounts>/
-│   └── lib/lpkg/         the package manager database (db/, archives)
+│   ├── usr/              bin/, lib/, libexec/, include/, … (installed packages)
+│   └── lib/lpkg/         the package manager database (db/)
 └── mnt/
     └── legacy/   fat32   legacy scratch volume (no longer authoritative)
 ```
@@ -42,6 +47,13 @@ data volume*.
 The backing devices are IDE disks: `hdc` → ext4 (`/var`), `hdb` → FAT32
 (`/mnt/legacy`). These appear only in the mount table and `/etc/fstab`, not in
 paths.
+
+`/bin` stays ramfs (immutable, kernel-materialized) so a usable command set and
+PATH fallback always exist, even in rescue mode. `/usr`, by contrast, firmlinks
+onto persistent ext4: `lpkg install` writes binaries under `/usr` once and they
+survive every reboot. The musl dynamic loader is the lone `PT_INTERP` path
+outside `/usr` (`/lib/ld-musl-x86_64.so.1`); `/lib` is a ramfs directory holding
+just a firmlink to the loader's persistent home at `/var/usr/lib`.
 
 ### Boot mount sequence
 
@@ -64,8 +76,13 @@ config:
 ```c
 vfs_mkdir("/var/etc", 0755);
 vfs_mkdir("/var/home", 0755);
+vfs_mkdir("/var/usr", 0755);
 vfs_symlink("/var/etc",  "/etc");        /* firmlink */
 vfs_symlink("/var/home", "/home");       /* firmlink */
+vfs_symlink("/var/usr",  "/usr");        /* firmlink: persistent install prefix */
+vfs_mkdir("/lib", 0755);
+vfs_symlink("/var/usr/lib/ld-musl-x86_64.so.1",
+            "/lib/ld-musl-x86_64.so.1"); /* loader firmlink (may dangle) */
 ```
 
 Only these essentials are bootstrapped in `kmain` (they must be up before
@@ -90,8 +107,11 @@ hdb  /mnt/legacy  fat32   rw 0 0
 
 If the `/var` (ext4) volume fails to mount at boot, the kernel sets a rescue
 flag, logs it, and `m10_setup()` falls back to creating `/etc` and `/home` as
-plain ramfs directories seeded with factory defaults. The system still boots to
-a usable login — state simply does not persist until the data volume is healthy.
+plain ramfs directories seeded with factory defaults. The `/usr` and loader
+firmlinks are **not** created in rescue mode (their target volume is absent), so
+dynamically-linked installed apps cannot run — but the immutable, statically
+linked `/bin` command set always works. The system still boots to a usable
+login; state simply does not persist until the data volume is healthy.
 
 ## 3. VFS contract (`include/vfs.h`, `kernel/vfs.c`)
 
@@ -126,7 +146,12 @@ filesystems (ramfs), where the in-core inode is already the source of truth.
 `vfs_lookup_path()` resolves an absolute path by walking components from the
 root (`vfs_walk`):
 
-1. `.` is skipped; `..` ascends via `dentry->parent`.
+1. `.` is skipped; `..` ascends via `dentry->parent`. Because disk filesystems
+   (ext4) mint a fresh dentry per `lookup` and cannot know the parent dentry,
+   the walk anchors each resolved child to the directory it was looked up in
+   (`next->parent = current`), so a later `..` ascends to the *real* parent.
+   This is what lets `..`-relative paths such as gcc's internal
+   `/usr/bin/../libexec/gcc/.../cc1` resolve across the ext4 volume.
 2. **Mount crossing:** before resolving inside a directory and on the final
    dentry, while `dentry->mount` is set, the walk steps into that mounted
    superblock's root. This is how `/var` resolves into the ext4 volume.
@@ -163,8 +188,14 @@ features:
 
 - Superblock, block-group descriptors, block/inode **bitmaps** (allocate +
   free), the inode table.
-- **Extent-mapped** inodes, inline (depth-0) extent trees for writes; extent
-  append on growth.
+- **Extent-mapped** inodes with full **extent-tree** writes: files start with
+  the inline (depth-0) list in the inode (4 records) and grow into a real
+  on-disk tree (index + leaf blocks, arbitrary depth) when it fills, so
+  large/fragmented files (gcc's 43 MB `cc1`) write correctly. Block allocation
+  hands out **contiguous runs** to keep the extent count low, and out-of-order
+  (back-seek) writes — e.g. a linker patching its output — are inserted in
+  **sorted** logical-block order so the on-disk tree stays `e2fsck`-clean.
+  Truncate/unlink free both data blocks and tree (index/leaf) metadata.
 - Directory entries (`ext4_dir_entry_2`): idempotent insert (`create`/`mkdir`
   reject duplicates via `ext4_dir_find`) and remove.
 - Inode writeback, file **truncate**, link-count maintenance, and proper
@@ -191,21 +222,27 @@ retirement (roadmap N3).
 
 | Path | Backing | Persists? | Notes |
 |------|---------|-----------|-------|
-| `/`, `/bin`, `/usr` | ramfs | No | rebuilt from the kernel image each boot |
+| `/`, `/bin` | ramfs | No | rebuilt from the kernel image each boot |
+| `/lib` | ramfs | No | holds only the loader firmlink → `/var/usr/lib` |
 | `/etc` | ext4 via firmlink → `/var/etc` | **Yes** | passwd/shadow/group/hostname/conf |
 | `/home` | ext4 via firmlink → `/var/home` | **Yes** | per-user home directories |
+| `/usr` | ext4 via firmlink → `/var/usr` | **Yes** | installed packages (bin/lib/libexec/include) |
 | `/var` | ext4 (`hdc`) | **Yes** | the data volume root |
-| `/var/lib/lpkg` | ext4 | **Yes** | package database + archives |
+| `/var/lib/lpkg` | ext4 | **Yes** | package database (`db/`) |
 | `/mnt/legacy` | fat32 (`hdb`) | Yes | legacy scratch, not authoritative |
 | `/proc`, `/dev` | procfs/devfs | No | synthetic |
 
-Because `/etc` and `/home` are firmlinks onto ext4, edits (via `useradd`,
-`passwd`, the Settings app, an editor, …) land on disk **in place**. There is no
-copy-in at boot and no `etc_sync` mirroring — `m10_setup` only *seeds factory
-defaults when absent*, and `etc_sync()` is a retained no-op.
+Because `/etc`, `/home`, and `/usr` are firmlinks onto ext4, edits (via
+`useradd`, `passwd`, the Settings app, an editor, …) and package installs land
+on disk **in place**. There is no copy-in at boot and no `etc_sync` mirroring —
+`m10_setup` only *seeds factory defaults when absent*, and `etc_sync()` is a
+retained no-op.
 
-Package payloads install into the volatile system tree but are recorded in the
-persistent DB; `lpkg sync` re-extracts them after a reboot (roadmap N4).
+`lpkg install` writes package payloads directly under the persistent `/usr`
+prefix, so they survive reboot with no re-extraction. Boot only mounts `/var`
+and re-creates the firmlinks (a few milliseconds), regardless of how much is
+installed. The DB under `/var/lib/lpkg` records the install for `list`/`info`/
+`remove`; `lpkg sync` is now a no-op (the old boot-time re-extract is retired).
 
 ## 6. Recovery & integrity
 
@@ -242,8 +279,9 @@ real file**, not via a hardcoded in-kernel command table:
 - Essential mounts are bootstrapped in `kmain`; the rest are `fstab`-driven via
   `mount_fstab()`, surfaced in `/proc/mounts`.
 - No **bind mounts** and no subdirectory mounts; firmlinks use symlinks.
-- ext4 writes use depth-0 (inline) extents only; very large/fragmented files are
-  not yet supported for write. No journaling (the volume is crash-consistent via
-  write-through, not via the ext4 journal).
+- ext4 writes use a full extent tree (inline depth-0 list growing into on-disk
+  index/leaf blocks), so large and fragmented files write correctly; there is no
+  journaling (the volume is crash-consistent via write-through, not via the ext4
+  journal).
 - FAT32 remains mounted as legacy and is pending removal (N3).
 - See `adr/0013` for the longer-term option of making ext4 the true root `/`.

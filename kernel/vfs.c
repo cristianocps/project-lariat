@@ -210,6 +210,13 @@ static struct vfs_dentry *vfs_walk(struct vfs_dentry *start, const char *path,
 
         if (!next) return NULL;
 
+        /* Anchor the resolved child to the directory we looked it up in, so a
+         * later ".." ascends to the real parent.  Disk filesystems (ext4) mint
+         * fresh dentries per lookup and cannot know the parent dentry, so they
+         * leave it pointing at the volume root; correct it here where the walk
+         * holds the true parent.  For cached ramfs children this is a no-op. */
+        next->parent = current;
+
         /* Symbolic link: resolve its target, then continue with the rest of
          * the path from there (absolute targets restart at the root). */
         if (next->inode && S_ISLNK(next->inode->mode)) {

@@ -225,10 +225,11 @@ static uint64_t ext4_find_extent_block(ext4_fs_t *fs, struct ext4_inode *inode,
  * i.e. 32-byte group descriptors, no 64-bit fields, and no metadata/bitmap/
  * inode checksums - so writeback never has to compute CRCs.  There is no
  * journal (RECOVER is rejected at mount), so updates are written straight
- * through; the write-through block cache keeps things coherent.  Files use
- * inline (depth-0) extents with up to 4 records, which is ample for the
- * configuration files and packages we store; growing into a full extent tree
- * is intentionally not supported and returns an error.
+ * through; the write-through block cache keeps things coherent.  Files start
+ * with the inline (depth-0) extent list in the inode (up to 4 records) and
+ * grow into a real on-disk extent tree (index + leaf blocks, arbitrary depth)
+ * when that fills, so large/fragmented writes are fully supported.  Block
+ * allocation hands out contiguous runs so a large file maps to few extents.
  * -------------------------------------------------------------------------- */
 static int ext4_write_block(ext4_fs_t *fs, uint64_t block, const void *buf) {
     uint64_t lba = block * (fs->block_size / 512);
@@ -336,6 +337,46 @@ static void ext4_free_block(ext4_fs_t *fs, uint64_t abs) {
     kfree(bm);
 }
 
+/* Allocate a contiguous run of up to `want` free data blocks from a single
+ * group (so the run is physically contiguous).  Returns the absolute start
+ * block and the actual count obtained in *out_got, or 0 on failure.  Blocks
+ * are NOT zeroed (the writer overwrites them); metadata blocks use the
+ * single-block, zeroing allocator instead. */
+static uint64_t ext4_alloc_block_run(ext4_fs_t *fs, uint32_t want, uint32_t *out_got) {
+    *out_got = 0;
+    if (want == 0) want = 1;
+    if (want > 32768) want = 32768;     /* max len of one initialized extent */
+    uint8_t *bm = kzalloc(fs->block_size);
+    if (!bm) return 0;
+    for (uint32_t bg = 0; bg < fs->groups_count; bg++) {
+        struct ext4_group_desc *gd = ext4_gd(fs, bg);
+        if (gd->bg_free_blocks_count_lo == 0) continue;
+        uint64_t bm_block = ext4_bg_block_bitmap(fs, bg);
+        if (ext4_read_block(fs, bm_block, bm) < 0) break;
+        uint32_t bpg = fs->sb.s_blocks_per_group;
+        for (uint32_t bit = 0; bit < bpg; bit++) {
+            if (bm[bit / 8] & (1u << (bit % 8))) continue;
+            uint32_t run = 0;
+            while (bit + run < bpg && run < want &&
+                   !(bm[(bit + run) / 8] & (1u << ((bit + run) % 8))))
+                run++;
+            for (uint32_t k = 0; k < run; k++)
+                bm[(bit + k) / 8] |= (1u << ((bit + k) % 8));
+            if (ext4_write_block(fs, bm_block, bm) < 0) { kfree(bm); return 0; }
+            gd->bg_free_blocks_count_lo = (uint16_t)(gd->bg_free_blocks_count_lo - run);
+            if (fs->sb.s_free_blocks_count_lo >= run)
+                fs->sb.s_free_blocks_count_lo -= run;
+            ext4_sync_meta(fs);
+            uint64_t abs = (uint64_t)bg * bpg + fs->sb.s_first_data_block + bit;
+            *out_got = run;
+            kfree(bm);
+            return abs;
+        }
+    }
+    kfree(bm);
+    return 0;
+}
+
 /* Allocate an inode number; marks it used in the bitmap and updates counts.
  * `is_dir` bumps the group's used-dirs count.  Returns 0 on failure. */
 static uint32_t ext4_alloc_inode(ext4_fs_t *fs, int is_dir) {
@@ -383,34 +424,409 @@ static void ext4_free_inode(ext4_fs_t *fs, uint32_t inode_no, int is_dir) {
     kfree(bm);
 }
 
-/* Append one freshly-allocated physical block as logical block `lblk` to the
- * inode's inline (depth-0) extent list, coalescing with the last extent when
- * contiguous.  Returns 0 on success, -1 if the extent list is full (would need
- * a real tree, unsupported) or the inode is not extent-mapped. */
-static int ext4_extent_append(struct ext4_inode *inode, uint32_t lblk, uint64_t phys) {
-    struct ext4_extent_header *eh = (struct ext4_extent_header *)inode->i_block;
-    if (eh->eh_magic != EXT4_EXTENT_MAGIC || eh->eh_depth != 0)
+/* Max extent/index records that fit in a full block's extent node (the inode
+ * root keeps its own smaller eh_max of 4). */
+static inline uint32_t ext4_eh_block_max(ext4_fs_t *fs) {
+    return (fs->block_size - (uint32_t)sizeof(struct ext4_extent_header)) /
+           (uint32_t)sizeof(struct ext4_extent);
+}
+
+/* Grow the tree by one level: move the root's contents into a fresh child
+ * block and turn the inode root into a one-entry index node pointing at it.
+ * After this the root has free index slots again.  Returns 0 on success. */
+static int ext4_grow_depth(ext4_fs_t *fs, struct ext4_inode *inode) {
+    struct ext4_extent_header *root = (struct ext4_extent_header *)inode->i_block;
+    uint64_t cblk = ext4_alloc_block(fs);
+    if (cblk == 0) return -1;
+
+    uint8_t *cb = kzalloc(fs->block_size);
+    if (!cb) { ext4_free_block(fs, cblk); return -1; }
+
+    /* Copy the whole root node (header + entries) into the child, then widen
+     * the child's eh_max to the block capacity. */
+    uint32_t rootbytes = (uint32_t)sizeof(struct ext4_extent_header) +
+                         root->eh_entries * (uint32_t)sizeof(struct ext4_extent);
+    memcpy(cb, root, rootbytes);
+    struct ext4_extent_header *ch = (struct ext4_extent_header *)cb;
+    ch->eh_max = (uint16_t)ext4_eh_block_max(fs);
+    if (ext4_write_block(fs, cblk, cb) < 0) { kfree(cb); ext4_free_block(fs, cblk); return -1; }
+    kfree(cb);
+    inode->i_blocks_lo += fs->block_size / 512;
+
+    /* First logical block covered by the (former root, now child) subtree. */
+    uint32_t first_blk;
+    if (root->eh_depth == 0)
+        first_blk = ((struct ext4_extent *)(root + 1))->ee_block;
+    else
+        first_blk = ((struct ext4_extent_idx *)(root + 1))->ei_block;
+
+    uint16_t newdepth = (uint16_t)(root->eh_depth + 1);
+    memset(inode->i_block, 0, sizeof(inode->i_block));
+    root->eh_magic = EXT4_EXTENT_MAGIC;
+    root->eh_entries = 1;
+    root->eh_max = (60 - (uint16_t)sizeof(struct ext4_extent_header)) /
+                   (uint16_t)sizeof(struct ext4_extent);   /* 4 */
+    root->eh_depth = newdepth;
+    struct ext4_extent_idx *ix = (struct ext4_extent_idx *)(root + 1);
+    ix->ei_block = first_blk;
+    ix->ei_leaf_lo = (uint32_t)cblk;
+    ix->ei_leaf_hi = (uint16_t)(cblk >> 32);
+    return 0;
+}
+
+/* Append a run of `len` contiguous physical blocks (phys..phys+len) mapping
+ * logical blocks starting at `lblk` (which must be the current end of the
+ * file/dir) to the inode's extent tree, growing the tree (index/leaf blocks,
+ * arbitrary depth) as needed.  Coalesces with the rightmost extent when
+ * contiguous.  Caller accounts for the data blocks in i_blocks; this routine
+ * accounts only for the metadata (index/leaf) blocks it allocates.  Returns 0
+ * on success, -1 on failure (no partial corruption: the tree is left valid). */
+#define EXT4_PATH_MAX 8
+static int ext4_extent_append(ext4_fs_t *fs, struct ext4_inode *inode,
+                              uint32_t lblk, uint64_t phys, uint32_t len) {
+    struct ext4_extent_header *root = (struct ext4_extent_header *)inode->i_block;
+    if (root->eh_magic != EXT4_EXTENT_MAGIC) return -1;
+    if (len == 0) return 0;
+    if (len > 32768) return -1;
+
+    /* Walk the rightmost path from the root down to the leaf. */
+    uint64_t pblk[EXT4_PATH_MAX];
+    uint8_t *pbuf[EXT4_PATH_MAX];
+    struct ext4_extent_header *phdr[EXT4_PATH_MAX];
+    int depth = root->eh_depth;
+    if (depth + 1 >= EXT4_PATH_MAX) return -1;
+
+    pblk[0] = 0; pbuf[0] = NULL; phdr[0] = root;
+    int ok = 1;
+    for (int lvl = 0; lvl < depth; lvl++) {
+        struct ext4_extent_header *h = phdr[lvl];
+        if (h->eh_entries == 0) { ok = 0; break; }
+        struct ext4_extent_idx *idx = (struct ext4_extent_idx *)(h + 1);
+        uint64_t child = ((uint64_t)idx[h->eh_entries - 1].ei_leaf_hi << 32) |
+                         idx[h->eh_entries - 1].ei_leaf_lo;
+        uint8_t *cb = kzalloc(fs->block_size);
+        if (!cb) { ok = 0; break; }
+        if (ext4_read_block(fs, child, cb) < 0) { kfree(cb); ok = 0; break; }
+        struct ext4_extent_header *ceh = (struct ext4_extent_header *)cb;
+        if (ceh->eh_magic != EXT4_EXTENT_MAGIC) { kfree(cb); ok = 0; break; }
+        pblk[lvl + 1] = child; pbuf[lvl + 1] = cb; phdr[lvl + 1] = ceh;
+    }
+    if (!ok) {
+        for (int lvl = 1; lvl <= depth; lvl++) if (pbuf[lvl]) kfree(pbuf[lvl]);
         return -1;
-    struct ext4_extent *ext = (struct ext4_extent *)(eh + 1);
-    if (eh->eh_entries > 0) {
-        struct ext4_extent *last = &ext[eh->eh_entries - 1];
+    }
+
+#define EXT4_PATH_DROP() do { for (int _l = 1; _l <= depth; _l++) if (pbuf[_l]) kfree(pbuf[_l]); } while (0)
+
+    struct ext4_extent_header *lh = phdr[depth];
+    struct ext4_extent *lx = (struct ext4_extent *)(lh + 1);
+
+    /* 1. Coalesce with the rightmost extent if physically/logically contiguous. */
+    if (lh->eh_entries > 0) {
+        struct ext4_extent *last = &lx[lh->eh_entries - 1];
         uint64_t lstart = ((uint64_t)last->ee_start_hi << 32) | last->ee_start_lo;
         if (last->ee_block + last->ee_len == lblk &&
             lstart + last->ee_len == phys &&
-            last->ee_len < 32768) {
-            last->ee_len++;
-            return 0;
+            (uint32_t)last->ee_len + len <= 32768) {
+            last->ee_len = (uint16_t)(last->ee_len + len);
+            int rc = (pblk[depth] != 0) ? ext4_write_block(fs, pblk[depth], pbuf[depth]) : 0;
+            EXT4_PATH_DROP();
+            return rc;
         }
     }
-    if (eh->eh_entries >= eh->eh_max)
-        return -1;   /* inline list full; extent tree not supported */
-    struct ext4_extent *ne = &ext[eh->eh_entries];
-    ne->ee_block = lblk;
-    ne->ee_len = 1;
-    ne->ee_start_hi = (uint16_t)(phys >> 32);
-    ne->ee_start_lo = (uint32_t)phys;
-    eh->eh_entries++;
-    return 0;
+
+    /* 2. Room in the leaf: append a new extent record. */
+    uint32_t leaf_max = (pblk[depth] == 0) ? lh->eh_max : ext4_eh_block_max(fs);
+    if (lh->eh_entries < leaf_max) {
+        struct ext4_extent *ne = &lx[lh->eh_entries];
+        ne->ee_block = lblk; ne->ee_len = (uint16_t)len;
+        ne->ee_start_hi = (uint16_t)(phys >> 32); ne->ee_start_lo = (uint32_t)phys;
+        lh->eh_entries++;
+        int rc = (pblk[depth] != 0) ? ext4_write_block(fs, pblk[depth], pbuf[depth]) : 0;
+        EXT4_PATH_DROP();
+        return rc;
+    }
+
+    /* 3. Leaf full: find the deepest ancestor index node with a free slot. */
+    int p = -1;
+    for (int lvl = depth - 1; lvl >= 0; lvl--) {
+        uint32_t mx = (pblk[lvl] == 0) ? phdr[lvl]->eh_max : ext4_eh_block_max(fs);
+        if (phdr[lvl]->eh_entries < mx) { p = lvl; break; }
+    }
+    if (p < 0) {
+        /* Whole rightmost path full: deepen the tree and retry. */
+        EXT4_PATH_DROP();
+        if (ext4_grow_depth(fs, inode) < 0) return -1;
+        return ext4_extent_append(fs, inode, lblk, phys, len);
+    }
+
+    /* Build a fresh spine: a new leaf at the bottom plus new index blocks for
+     * every level between p (exclusive) and the leaf, then link it under p. */
+    uint64_t leafblk = ext4_alloc_block(fs);
+    if (leafblk == 0) { EXT4_PATH_DROP(); return -1; }
+    inode->i_blocks_lo += fs->block_size / 512;
+    {
+        uint8_t *lb = kzalloc(fs->block_size);
+        if (!lb) { ext4_free_block(fs, leafblk); EXT4_PATH_DROP(); return -1; }
+        struct ext4_extent_header *nlh = (struct ext4_extent_header *)lb;
+        nlh->eh_magic = EXT4_EXTENT_MAGIC;
+        nlh->eh_entries = 1;
+        nlh->eh_max = (uint16_t)ext4_eh_block_max(fs);
+        nlh->eh_depth = 0;
+        struct ext4_extent *nx = (struct ext4_extent *)(nlh + 1);
+        nx->ee_block = lblk; nx->ee_len = (uint16_t)len;
+        nx->ee_start_hi = (uint16_t)(phys >> 32); nx->ee_start_lo = (uint32_t)phys;
+        int rc = ext4_write_block(fs, leafblk, lb);
+        kfree(lb);
+        if (rc < 0) { ext4_free_block(fs, leafblk); EXT4_PATH_DROP(); return -1; }
+    }
+
+    uint64_t child = leafblk;
+    for (int lvl = depth - 1; lvl > p; lvl--) {
+        uint64_t idxblk = ext4_alloc_block(fs);
+        if (idxblk == 0) { EXT4_PATH_DROP(); return -1; }
+        inode->i_blocks_lo += fs->block_size / 512;
+        uint8_t *ib = kzalloc(fs->block_size);
+        if (!ib) { ext4_free_block(fs, idxblk); EXT4_PATH_DROP(); return -1; }
+        struct ext4_extent_header *ih = (struct ext4_extent_header *)ib;
+        ih->eh_magic = EXT4_EXTENT_MAGIC;
+        ih->eh_entries = 1;
+        ih->eh_max = (uint16_t)ext4_eh_block_max(fs);
+        ih->eh_depth = (uint16_t)(depth - lvl);
+        struct ext4_extent_idx *ix = (struct ext4_extent_idx *)(ih + 1);
+        ix->ei_block = lblk;
+        ix->ei_leaf_lo = (uint32_t)child;
+        ix->ei_leaf_hi = (uint16_t)(child >> 32);
+        int rc = ext4_write_block(fs, idxblk, ib);
+        kfree(ib);
+        if (rc < 0) { ext4_free_block(fs, idxblk); EXT4_PATH_DROP(); return -1; }
+        child = idxblk;
+    }
+
+    /* Link the new spine under the chosen ancestor index node at level p. */
+    struct ext4_extent_header *ph = phdr[p];
+    struct ext4_extent_idx *pix = (struct ext4_extent_idx *)(ph + 1);
+    pix[ph->eh_entries].ei_block = lblk;
+    pix[ph->eh_entries].ei_leaf_lo = (uint32_t)child;
+    pix[ph->eh_entries].ei_leaf_hi = (uint16_t)(child >> 32);
+    pix[ph->eh_entries].ei_unused = 0;
+    ph->eh_entries++;
+    int rc = (pblk[p] != 0) ? ext4_write_block(fs, pblk[p], pbuf[p]) : 0;
+    EXT4_PATH_DROP();
+    return rc;
+#undef EXT4_PATH_DROP
+}
+
+/* First logical block covered by a node (its lowest extent/index entry). */
+static uint32_t ext4_node_first_block(struct ext4_extent_header *h) {
+    if (h->eh_entries == 0) return 0;
+    if (h->eh_depth == 0) return ((struct ext4_extent *)(h + 1))[0].ee_block;
+    return ((struct ext4_extent_idx *)(h + 1))[0].ei_block;
+}
+
+/* Logical end (last mapped block + 1) of the file, found by descending the
+ * rightmost path.  Used to route a write to the append fast path vs. the
+ * sorted-insert path. */
+static uint32_t ext4_tree_end(ext4_fs_t *fs, struct ext4_inode *inode) {
+    struct ext4_extent_header *h = (struct ext4_extent_header *)inode->i_block;
+    if (h->eh_magic != EXT4_EXTENT_MAGIC) return 0;
+    uint8_t *buf = NULL;
+    while (h->eh_depth > 0) {
+        if (h->eh_entries == 0) { if (buf) kfree(buf); return 0; }
+        struct ext4_extent_idx *idx = (struct ext4_extent_idx *)(h + 1);
+        uint64_t child = ((uint64_t)idx[h->eh_entries - 1].ei_leaf_hi << 32) |
+                         idx[h->eh_entries - 1].ei_leaf_lo;
+        if (!buf) buf = kzalloc(fs->block_size);
+        if (!buf) return 0;
+        if (ext4_read_block(fs, child, buf) < 0) { kfree(buf); return 0; }
+        h = (struct ext4_extent_header *)buf;
+    }
+    uint32_t end = 0;
+    if (h->eh_entries > 0) {
+        struct ext4_extent *e = (struct ext4_extent *)(h + 1);
+        end = e[h->eh_entries - 1].ee_block + e[h->eh_entries - 1].ee_len;
+    }
+    if (buf) kfree(buf);
+    return end;
+}
+
+/* Insert (lblk,phys,len) into a leaf node that is guaranteed to have room (or
+ * to coalesce), keeping records sorted by logical block and merging with a
+ * physically/logically contiguous neighbour. */
+static void ext4_leaf_put(struct ext4_extent_header *h, uint32_t lblk,
+                          uint64_t phys, uint32_t len) {
+    struct ext4_extent *ext = (struct ext4_extent *)(h + 1);
+    int n = h->eh_entries;
+    int pos = 0;
+    while (pos < n && ext[pos].ee_block <= lblk) pos++;
+    if (pos > 0) {                                  /* coalesce with previous */
+        struct ext4_extent *pv = &ext[pos - 1];
+        uint64_t pp = ((uint64_t)pv->ee_start_hi << 32) | pv->ee_start_lo;
+        if (pv->ee_block + pv->ee_len == lblk && pp + pv->ee_len == phys &&
+            (uint32_t)pv->ee_len + len <= 32768) {
+            pv->ee_len = (uint16_t)(pv->ee_len + len);
+            return;
+        }
+    }
+    if (pos < n) {                                  /* coalesce with next */
+        struct ext4_extent *nx = &ext[pos];
+        uint64_t np = ((uint64_t)nx->ee_start_hi << 32) | nx->ee_start_lo;
+        if (lblk + len == nx->ee_block && phys + len == np &&
+            (uint32_t)nx->ee_len + len <= 32768) {
+            nx->ee_block = lblk;
+            nx->ee_start_hi = (uint16_t)(phys >> 32);
+            nx->ee_start_lo = (uint32_t)phys;
+            nx->ee_len = (uint16_t)(nx->ee_len + len);
+            return;
+        }
+    }
+    for (int i = n; i > pos; i--) ext[i] = ext[i - 1];
+    ext[pos].ee_block = lblk; ext[pos].ee_len = (uint16_t)len;
+    ext[pos].ee_start_hi = (uint16_t)(phys >> 32);
+    ext[pos].ee_start_lo = (uint32_t)phys;
+    h->eh_entries++;
+}
+
+/* Insert an index entry (ei_block -> leaf) sorted into an index node with room. */
+static void ext4_idx_put(struct ext4_extent_header *h, uint32_t ei_block, uint64_t leaf) {
+    struct ext4_extent_idx *idx = (struct ext4_extent_idx *)(h + 1);
+    int n = h->eh_entries;
+    int pos = 0;
+    while (pos < n && idx[pos].ei_block <= ei_block) pos++;
+    for (int i = n; i > pos; i--) idx[i] = idx[i - 1];
+    idx[pos].ei_block = ei_block;
+    idx[pos].ei_leaf_lo = (uint32_t)leaf;
+    idx[pos].ei_leaf_hi = (uint16_t)(leaf >> 32);
+    idx[pos].ei_unused = 0;
+    h->eh_entries++;
+}
+
+/* Map a run of `len` contiguous blocks at logical `lblk` (which falls *before*
+ * the current end of file, i.e. an out-of-order / back-seek write) into the
+ * extent tree, keeping all extents sorted by logical block so the on-disk tree
+ * stays e2fsck-clean.  The caller guarantees the range is not already mapped.
+ * Splits a full leaf and deepens the tree as needed.  Returns 0 / -1. */
+static int ext4_extent_map(ext4_fs_t *fs, struct ext4_inode *inode,
+                           uint32_t lblk, uint64_t phys, uint32_t len) {
+    struct ext4_extent_header *root = (struct ext4_extent_header *)inode->i_block;
+    if (root->eh_magic != EXT4_EXTENT_MAGIC || len == 0 || len > 32768) return -1;
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        uint64_t pblk[EXT4_PATH_MAX];
+        uint8_t *pbuf[EXT4_PATH_MAX];
+        struct ext4_extent_header *phdr[EXT4_PATH_MAX];
+        int pidx[EXT4_PATH_MAX];
+        int depth = root->eh_depth;
+        if (depth + 1 >= EXT4_PATH_MAX) return -1;
+        pblk[0] = 0; pbuf[0] = NULL; phdr[0] = root;
+
+        int fail = 0;
+        for (int lvl = 0; lvl < depth; lvl++) {
+            struct ext4_extent_header *h = phdr[lvl];
+            struct ext4_extent_idx *idx = (struct ext4_extent_idx *)(h + 1);
+            int n = h->eh_entries, ci = 0;
+            while (ci + 1 < n && idx[ci + 1].ei_block <= lblk) ci++;
+            pidx[lvl] = ci;
+            uint64_t child = ((uint64_t)idx[ci].ei_leaf_hi << 32) | idx[ci].ei_leaf_lo;
+            uint8_t *cb = kzalloc(fs->block_size);
+            if (!cb) { fail = 1; break; }
+            if (ext4_read_block(fs, child, cb) < 0) { kfree(cb); fail = 1; break; }
+            pblk[lvl + 1] = child; pbuf[lvl + 1] = cb;
+            phdr[lvl + 1] = (struct ext4_extent_header *)cb;
+        }
+        if (fail) { for (int l = 1; l <= depth; l++) if (pbuf[l]) kfree(pbuf[l]); return -1; }
+
+#define EXT4_MAP_DROP() do { for (int _l = 1; _l <= depth; _l++) if (pbuf[_l]) kfree(pbuf[_l]); } while (0)
+
+        struct ext4_extent_header *lh = phdr[depth];
+        struct ext4_extent *lext = (struct ext4_extent *)(lh + 1);
+        uint32_t leaf_max = (pblk[depth] == 0) ? lh->eh_max : ext4_eh_block_max(fs);
+
+        /* A coalescing insert needs no new slot. */
+        int can_coalesce = 0;
+        {
+            int n = lh->eh_entries, pos = 0;
+            while (pos < n && lext[pos].ee_block <= lblk) pos++;
+            if (pos > 0) {
+                struct ext4_extent *pv = &lext[pos - 1];
+                uint64_t pp = ((uint64_t)pv->ee_start_hi << 32) | pv->ee_start_lo;
+                if (pv->ee_block + pv->ee_len == lblk && pp + pv->ee_len == phys &&
+                    (uint32_t)pv->ee_len + len <= 32768) can_coalesce = 1;
+            }
+            if (!can_coalesce && pos < n) {
+                struct ext4_extent *nx = &lext[pos];
+                uint64_t np = ((uint64_t)nx->ee_start_hi << 32) | nx->ee_start_lo;
+                if (lblk + len == nx->ee_block && phys + len == np &&
+                    (uint32_t)nx->ee_len + len <= 32768) can_coalesce = 1;
+            }
+        }
+
+        if (lh->eh_entries < leaf_max || can_coalesce) {
+            ext4_leaf_put(lh, lblk, phys, len);
+            if (pblk[depth] != 0) ext4_write_block(fs, pblk[depth], pbuf[depth]);
+            uint32_t fb = ext4_node_first_block(lh);   /* propagate lowered first block */
+            for (int lvl = depth - 1; lvl >= 0; lvl--) {
+                struct ext4_extent_idx *idx = (struct ext4_extent_idx *)(phdr[lvl] + 1);
+                if (idx[pidx[lvl]].ei_block != fb) {
+                    idx[pidx[lvl]].ei_block = fb;
+                    if (pblk[lvl] != 0) ext4_write_block(fs, pblk[lvl], pbuf[lvl]);
+                }
+                fb = ext4_node_first_block(phdr[lvl]);
+            }
+            EXT4_MAP_DROP();
+            return 0;
+        }
+
+        if (depth == 0) {                       /* full inline root: deepen, retry */
+            EXT4_MAP_DROP();
+            if (ext4_grow_depth(fs, inode) < 0) return -1;
+            continue;
+        }
+
+        struct ext4_extent_header *parent = phdr[depth - 1];
+        uint32_t par_max = (pblk[depth - 1] == 0) ? parent->eh_max : ext4_eh_block_max(fs);
+        if (parent->eh_entries >= par_max) {    /* no room to add a leaf: deepen, retry */
+            EXT4_MAP_DROP();
+            if (ext4_grow_depth(fs, inode) < 0) return -1;
+            continue;
+        }
+
+        /* Split the full leaf; the upper half moves to a fresh block. */
+        uint64_t nb = ext4_alloc_block(fs);
+        if (nb == 0) { EXT4_MAP_DROP(); return -1; }
+        inode->i_blocks_lo += fs->block_size / 512;
+        uint8_t *rb = kzalloc(fs->block_size);
+        if (!rb) { ext4_free_block(fs, nb); EXT4_MAP_DROP(); return -1; }
+        struct ext4_extent_header *rh = (struct ext4_extent_header *)rb;
+        int n = lh->eh_entries, half = n / 2;
+        rh->eh_magic = EXT4_EXTENT_MAGIC; rh->eh_depth = 0;
+        rh->eh_max = (uint16_t)ext4_eh_block_max(fs);
+        rh->eh_entries = (uint16_t)(n - half);
+        memcpy((struct ext4_extent *)(rh + 1), &lext[half],
+               (size_t)(n - half) * sizeof(struct ext4_extent));
+        lh->eh_entries = (uint16_t)half;
+        uint32_t split_block = ((struct ext4_extent *)(rh + 1))[0].ee_block;
+        if (lblk < split_block) ext4_leaf_put(lh, lblk, phys, len);
+        else                    ext4_leaf_put(rh, lblk, phys, len);
+        if (pblk[depth] != 0) ext4_write_block(fs, pblk[depth], pbuf[depth]);
+        ext4_write_block(fs, nb, rb);
+        struct ext4_extent_idx *ppx = (struct ext4_extent_idx *)(parent + 1);
+        ppx[pidx[depth - 1]].ei_block = ext4_node_first_block(lh);
+        ext4_idx_put(parent, ext4_node_first_block(rh), nb);
+        if (pblk[depth - 1] != 0) ext4_write_block(fs, pblk[depth - 1], pbuf[depth - 1]);
+        uint32_t fb = ext4_node_first_block(parent);
+        for (int lvl = depth - 2; lvl >= 0; lvl--) {
+            struct ext4_extent_idx *idx = (struct ext4_extent_idx *)(phdr[lvl] + 1);
+            idx[pidx[lvl]].ei_block = fb;
+            if (pblk[lvl] != 0) ext4_write_block(fs, pblk[lvl], pbuf[lvl]);
+            fb = ext4_node_first_block(phdr[lvl]);
+        }
+        kfree(rb);
+        EXT4_MAP_DROP();
+        return 0;
+#undef EXT4_MAP_DROP
+    }
+    return -1;
 }
 
 /* --------------------------------------------------------------------------
@@ -490,14 +906,27 @@ static ssize_t ext4_file_write(struct vfs_file *file, const void *buf, size_t co
         if (xbuf) kfree(xbuf);
 
         if (phys == 0) {
-            /* Need to back this logical block with a fresh physical block. */
-            uint64_t nb = ext4_alloc_block(fs);
-            if (nb == 0) break;
-            if (ext4_extent_append(inode, lblk, nb) < 0) {
-                ext4_free_block(fs, nb);
-                break;   /* extent list full (file too fragmented/large) */
+            /* Back this logical block (and as many following ones as we can in
+             * one contiguous run) with fresh physical blocks. */
+            uint64_t end = pos + (count - written);
+            uint32_t lastb = (uint32_t)((end - 1) / fs->block_size);
+            uint32_t want = lastb - lblk + 1;
+            if (want > 2048) want = 2048;     /* bound allocator work per call */
+            uint32_t got = 0;
+            uint64_t nb = ext4_alloc_block_run(fs, want, &got);
+            if (nb == 0 || got == 0) break;
+            /* Sequential writes append at the end (fast, grows the tree);
+             * out-of-order (back-seek) writes, e.g. a linker patching its
+             * output, insert in sorted order so the tree stays e2fsck-clean. */
+            uint32_t tend = ext4_tree_end(fs, inode);
+            int xrc = (lblk >= tend)
+                ? ext4_extent_append(fs, inode, lblk, nb, got)
+                : ext4_extent_map(fs, inode, lblk, nb, got);
+            if (xrc < 0) {
+                for (uint32_t b = 0; b < got; b++) ext4_free_block(fs, nb + b);
+                break;
             }
-            inode->i_blocks_lo += fs->block_size / 512;
+            inode->i_blocks_lo += got * (fs->block_size / 512);
             phys = nb;
             memset(block_buf, 0, fs->block_size);
         } else if (boff != 0 || chunk != fs->block_size) {
@@ -835,7 +1264,7 @@ static int ext4_dir_insert(ext4_fs_t *fs, ext4_inode_priv_t *dpriv,
     /* No room in existing blocks: append a fresh directory block. */
     uint64_t nb = ext4_alloc_block(fs);
     if (nb == 0) { kfree(blk); return -1; }
-    if (ext4_extent_append(dir, (uint32_t)(dsize / fs->block_size), nb) < 0) {
+    if (ext4_extent_append(fs, dir, (uint32_t)(dsize / fs->block_size), nb, 1) < 0) {
         ext4_free_block(fs, nb);
         kfree(blk);
         return -1;
@@ -904,31 +1333,65 @@ static int ext4_dir_remove(ext4_fs_t *fs, ext4_inode_priv_t *dpriv,
     return 0;   /* not found (out_ino stays 0) */
 }
 
+/* Recursively free, within the subtree whose header is `h` (depth eh_depth),
+ * every data block with logical number >= `from_lblk`, releasing any index/
+ * leaf metadata blocks that become entirely empty and trimming entry counts.
+ * `h` points into a caller-owned buffer (the inode i_block for the root, or a
+ * block buffer for a child); the caller persists/frees that buffer.  Updates
+ * inode->i_blocks_lo for both data and freed metadata blocks.  Returns the
+ * node's remaining entry count. */
+static int ext4_free_subtree_from(ext4_fs_t *fs, struct ext4_inode *inode,
+                                  struct ext4_extent_header *h, uint32_t from_lblk) {
+    if (h->eh_magic != EXT4_EXTENT_MAGIC) return 0;
+
+    if (h->eh_depth == 0) {
+        struct ext4_extent *ext = (struct ext4_extent *)(h + 1);
+        for (int i = (int)h->eh_entries - 1; i >= 0; i--) {
+            uint32_t e_start = ext[i].ee_block;
+            uint32_t e_end = e_start + ext[i].ee_len;      /* exclusive */
+            uint64_t phys = ((uint64_t)ext[i].ee_start_hi << 32) | ext[i].ee_start_lo;
+            if (e_end <= from_lblk) continue;              /* fully kept */
+            uint32_t keep = (from_lblk > e_start) ? (from_lblk - e_start) : 0;
+            for (uint32_t b = keep; b < ext[i].ee_len; b++) {
+                ext4_free_block(fs, phys + b);
+                inode->i_blocks_lo -= fs->block_size / 512;
+            }
+            if (keep == 0) h->eh_entries--;                /* drop whole extent */
+            else ext[i].ee_len = (uint16_t)keep;
+        }
+        return h->eh_entries;
+    }
+
+    struct ext4_extent_idx *idx = (struct ext4_extent_idx *)(h + 1);
+    for (int i = (int)h->eh_entries - 1; i >= 0; i--) {
+        uint32_t child_start = idx[i].ei_block;
+        uint64_t cblk = ((uint64_t)idx[i].ei_leaf_hi << 32) | idx[i].ei_leaf_lo;
+        uint8_t *cb = kzalloc(fs->block_size);
+        if (!cb) break;
+        if (ext4_read_block(fs, cblk, cb) < 0) { kfree(cb); continue; }
+        struct ext4_extent_header *ch = (struct ext4_extent_header *)cb;
+        int remaining = ext4_free_subtree_from(fs, inode, ch, from_lblk);
+        if (remaining == 0) {
+            ext4_free_block(fs, cblk);                     /* drop empty child */
+            inode->i_blocks_lo -= fs->block_size / 512;
+            h->eh_entries--;
+        } else {
+            ext4_write_block(fs, cblk, cb);                /* persist trimmed child */
+        }
+        kfree(cb);
+        if (child_start < from_lblk) break;                /* lower children fully kept */
+    }
+    return h->eh_entries;
+}
+
 /* Free every data block of an extent-mapped inode at or beyond logical block
- * `from_lblk`, trimming/removing the affected (depth-0) extents. */
+ * `from_lblk` (handles inline depth-0 extents and full extent trees). */
 static void ext4_free_blocks_from(ext4_fs_t *fs, struct ext4_inode *inode,
                                   uint32_t from_lblk) {
     struct ext4_extent_header *eh = (struct ext4_extent_header *)inode->i_block;
-    if (eh->eh_magic != EXT4_EXTENT_MAGIC || eh->eh_depth != 0) return;
-    struct ext4_extent *ext = (struct ext4_extent *)(eh + 1);
-
-    int n = eh->eh_entries;
-    for (int i = n - 1; i >= 0; i--) {
-        uint32_t e_start = ext[i].ee_block;
-        uint32_t e_end = e_start + ext[i].ee_len;      /* exclusive */
-        uint64_t phys = ((uint64_t)ext[i].ee_start_hi << 32) | ext[i].ee_start_lo;
-        if (e_end <= from_lblk) continue;              /* fully kept */
-        uint32_t keep = (from_lblk > e_start) ? (from_lblk - e_start) : 0;
-        for (uint32_t b = keep; b < ext[i].ee_len; b++) {
-            ext4_free_block(fs, phys + b);
-            inode->i_blocks_lo -= fs->block_size / 512;
-        }
-        if (keep == 0) {
-            eh->eh_entries--;          /* drop the whole (now-last) extent */
-        } else {
-            ext[i].ee_len = (uint16_t)keep;
-        }
-    }
+    if (eh->eh_magic != EXT4_EXTENT_MAGIC) return;
+    ext4_free_subtree_from(fs, inode, eh, from_lblk);
+    if (eh->eh_entries == 0) eh->eh_depth = 0;   /* canonical empty root */
 }
 
 /* Turn an inode (whose data blocks have already been released) into a freed
@@ -944,10 +1407,12 @@ static void ext4_mark_inode_deleted(struct ext4_inode *inode) {
     inode->i_size_lo = 0;
     inode->i_size_hi = 0;
     inode->i_blocks_lo = 0;
-    /* Reset the inline extent header so no data blocks appear referenced. */
+    /* Reset the extent header to an empty depth-0 root so no data or tree
+     * blocks appear referenced (the tree blocks were freed beforehand). */
     struct ext4_extent_header *eh = (struct ext4_extent_header *)inode->i_block;
     if (eh->eh_magic == EXT4_EXTENT_MAGIC) {
         eh->eh_entries = 0;
+        eh->eh_depth = 0;
     } else {
         memset(inode->i_block, 0, sizeof(inode->i_block));
     }
@@ -1003,7 +1468,7 @@ static int ext4_mkdir(struct vfs_inode *dir, const char *name, uint32_t mode) {
     struct ext4_inode ni;
     ext4_init_extent_inode(&ni, (uint16_t)(S_IFDIR | (mode & 0777)));
     ni.i_links_count = 2;     /* self + "." */
-    ext4_extent_append(&ni, 0, dblk);
+    ext4_extent_append(fs, &ni, 0, dblk, 1);
     ni.i_blocks_lo = fs->block_size / 512;
     ni.i_size_lo = fs->block_size;
 

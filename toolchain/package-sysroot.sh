@@ -8,7 +8,11 @@
 # Produces $OUT_DIR/libc-dev-<musl>.lpkg containing:
 #   /usr/include/...                 C/C++ headers (musl)
 #   /usr/lib/{crt*.o,libc.so,...}    link-time objects and libraries
-#   /lib/ld-musl-x86_64.so.1         musl dynamic loader (== libc.so)
+#   /usr/lib/ld-musl-x86_64.so.1     musl dynamic loader (== libc.so)
+#
+# The loader lives under the persistent /usr prefix (firmlinked to /var/usr);
+# the kernel firmlinks /lib/ld-musl-x86_64.so.1 -> /var/usr/lib/... at boot so
+# the PT_INTERP path still resolves.
 #
 # Install it first on-device:
 #   lpkg install /pkgs/libc-dev-1.2.5.lpkg
@@ -42,11 +46,12 @@ done < <(find "$SR/usr/lib" -type f -print0)
 
 # The dynamic loader the toolchain (and any dynamic binary) needs at runtime.
 # In musl the loader and libc are the same image; ship it under the PT_INTERP
-# name the kernel ELF loader expects.
+# basename but inside the persistent /usr/lib prefix (the kernel firmlinks
+# /lib/ld-musl-x86_64.so.1 -> /var/usr/lib/ld-musl-x86_64.so.1 at boot).
 if [ -f "$SR/lib/ld-musl-x86_64.so.1" ]; then
-    FILES+=("0755:$SR/lib/ld-musl-x86_64.so.1:lib/ld-musl-x86_64.so.1")
+    FILES+=("0755:$SR/lib/ld-musl-x86_64.so.1:usr/lib/ld-musl-x86_64.so.1")
 else
-    FILES+=("0755:$SR/usr/lib/libc.so:lib/ld-musl-x86_64.so.1")
+    FILES+=("0755:$SR/usr/lib/libc.so:usr/lib/ld-musl-x86_64.so.1")
 fi
 
 "$MKLPKG" --name libc-dev --version "$MUSL_VER" --deps "" \
