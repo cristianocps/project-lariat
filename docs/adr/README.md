@@ -24,3 +24,4 @@ starting point. Land an ADR in the same change as the code that implements it.
 | [0017](0017-on-device-make-and-relative-paths.md) | On-device builds — GNU make and cwd-relative path resolution | Accepted |
 | [0018](0018-dash-configure-shell.md) | dash as the configure shell, and the kernel fixes it forced | Accepted |
 | [0019](0019-persistent-usr-prefix.md) | Persistent /usr prefix via firmlinks and ext4 extent-tree writes | Accepted |
+| [0020](0020-evolution-roadmap-2026.md) | Evolution roadmap for 2026 — syscalls, filesystem, package manager, and desktop | Accepted |

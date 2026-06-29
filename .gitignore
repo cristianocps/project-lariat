@@ -30,7 +30,7 @@ sysroot/
 
 # Debug / core files
 *.log
-core
+/core
 *.core
 
 # QEMU screendumps / captures

@@ -175,6 +175,10 @@ phase is the hard prerequisite for bash and every interactive tool.
   large/fragmented files ✅ (gcc's 43 MB `cc1` writes correctly; sorted insert
   keeps linker back-seek output `e2fsck`-clean), and a **persistent `/usr`
   firmlink** that retires `lpkg sync` at boot (subsumes N4). See `adr/0019`.
+- **6f — ext4 advanced features:** symlinks and hard links on the persistent
+  data volume, followed by a metadata journal for crash consistency. These
+  unblock the GNU userland (symlinks in `/usr`, hard links in builds) and are
+  prerequisites for a reliable desktop. See `adr/0020`.
 
 ### Phase 7 — Self-hosted toolchain & build infrastructure 🚧
 Make the system able to build software *on itself*.
@@ -267,13 +271,28 @@ PATH). **Success:** a from-scratch GNU userland that rebuilds itself on device.
 ### Phase 9 — Ports system & portfolio growth 🧊
 **lports** — a declarative recipe format (fetch → verify → patch → configure →
 build → stage → `lpkg`) with a dependency graph and an on-device build driver
-(host-cross as the bootstrap). Scales from "one app" to a catalog. Folds in the
+(host-cross as the bootstrap). Package downloads are verified with SHA-256
+checksums and signatures from the first commit; the repository index and every
+`.lpkg` must be authenticated. Scales from "one app" to a catalog. Folds in the
 existing Python track (N7): full CPython + stdlib becomes a port. Early targets:
 `git`, `less`, `vim`/`nano`, `python3`.
 
 ### Phase 10 — glibc track 🧊
 Add glibc as an alternate libc with multi-loader coexistence, only as needed for
 apps that won't build against musl. Lower priority by design.
+
+### Phase 11 — Desktop environment (macOS-like) 🔜
+A cohesive graphical environment built on the window-server protocol (`adr/0005`)
+and Phase M IPC. Priorities, in order:
+- Shared-memory tiles and damage regions in the window server for performance.
+- Terminal.app on top of PTYs/termios/job control (Phase 6b).
+- Dock + Launcher for starting and switching apps.
+- Finder-style file manager.
+- Simple but real apps: Calculator, Notes, TextEdit, expanded Settings.
+- Global menu bar, clipboard, notifications, and virtual desktops.
+
+The desktop apps are regular `lpkg` packages, not kernel-embedded demos. See
+`adr/0020`.
 
 ## Conventions
 

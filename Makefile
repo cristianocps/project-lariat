@@ -5,8 +5,18 @@ LD      = ld
 OBJCOPY = objcopy
 # Portable QEMU runtime lives in-repo (persists across reboots, unlike /tmp).
 # Override QEMU_RT to point elsewhere if needed.
-QEMU_RT = $(CURDIR)/.local_libs/extract
-QEMU    = LD_LIBRARY_PATH=$(QEMU_RT)/usr/lib/x86_64-linux-gnu QEMU_MODULE_DIR=$(QEMU_RT)/usr/lib/x86_64-linux-gnu/qemu $(HOME)/.local/bin/qemu-system-x86_64
+QEMU_LOCAL := $(HOME)/.local/bin/qemu-system-x86_64
+QEMU_RT    := $(CURDIR)/.local_libs/extract
+
+ifneq ($(wildcard $(QEMU_LOCAL)),)
+    # Portable runtime present: use bundled libs and BIOS.
+    QEMU       := LD_LIBRARY_PATH=$(QEMU_RT)/usr/lib/x86_64-linux-gnu QEMU_MODULE_DIR=$(QEMU_RT)/usr/lib/x86_64-linux-gnu/qemu $(QEMU_LOCAL)
+    QEMU_FLAGS := -L $(QEMU_RT)/usr/share/qemu -L $(QEMU_RT)/usr/share/seabios
+else
+    # Fall back to the system QEMU and its default firmware search paths.
+    QEMU       := qemu-system-x86_64
+    QEMU_FLAGS :=
+endif
 
 CFLAGS  = -m64 -ffreestanding -Os -Wall -Wextra -nostdlib -nostartfiles \
           -fno-builtin -fno-exceptions -fno-stack-protector -nodefaultlibs \
@@ -15,7 +25,6 @@ CFLAGS  = -m64 -ffreestanding -Os -Wall -Wextra -nostdlib -nostartfiles \
           -Iinclude -Iinclude/uapi \
           -MMD -MP
 
-QEMU_FLAGS = -L $(QEMU_RT)/usr/share/qemu -L $(QEMU_RT)/usr/share/seabios
 
 BOOT_SRC   = boot/boot.asm
 LINKER     = linker.ld
